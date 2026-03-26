@@ -408,6 +408,8 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 			})
 			.on("ask", async (ctx) => {
 			const groupId = ctx.update.message!.chat.id; // numeric ID
+			const userId = ctx.update.message?.from?.id;
+			const repliedMessage = (ctx.update.message as any)?.reply_to_message;
 				
 				// Check whitelist
 				const { results: whitelistResults } = await env.DB.prepare(`
@@ -429,6 +431,10 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 					}
 					return new Response('ok');
 				}
+				if (!userId) {
+					await ctx.reply(`Unable to identify requesting user.`);
+					return new Response('ok');
+				}
 				let res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
 					"chat_id": userId,
 					"parse_mode": "MarkdownV2",
@@ -439,18 +445,42 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 					await ctx.reply(`Please start a private chat with the bot, otherwise unable to receive messages`);
 					return new Response('ok');
 				}
-				const { results } = await env.DB.prepare(`
-					WITH latest_1000 AS (
-						SELECT * FROM Messages
-						WHERE groupId=?
-						ORDER BY timeStamp DESC
-						LIMIT 1000
-					)
-					SELECT * FROM latest_1000
-					ORDER BY timeStamp ASC
-					`)
-					.bind(groupId)
-					.all();
+				const question = getCommandVar(messageText, " ");
+				let modelUserContent: any[] = [];
+				if (repliedMessage?.message_id) {
+					const repliedContent = repliedMessage.text || repliedMessage.caption || "[non-text message]";
+					const repliedUser = getUserName(repliedMessage);
+					const repliedLink = getMessageLink({ groupId: groupId.toString(), messageId: repliedMessage.message_id });
+					modelUserContent = [
+						dispatchContent(`The user asked /ask by replying to a specific message. Focus on the replied message and do not summarize the entire chat unless explicitly requested.`),
+						dispatchContent(`====================`),
+						dispatchContent(`${repliedUser}:`),
+						dispatchContent(repliedContent),
+						dispatchContent(repliedLink),
+						dispatchContent(`====================`),
+					];
+				} else {
+					const { results } = await env.DB.prepare(`
+						WITH latest_1000 AS (
+							SELECT * FROM Messages
+							WHERE groupId=?
+							ORDER BY timeStamp DESC
+							LIMIT 1000
+						)
+						SELECT * FROM latest_1000
+						ORDER BY timeStamp ASC
+						`)
+						.bind(groupId)
+						.all();
+					modelUserContent = results.flatMap(
+						(r: any) => [
+							dispatchContent(`====================`),
+							dispatchContent(`${r.userName}:`),
+							dispatchContent(r.content),
+							dispatchContent(getMessageLink(r)),
+						]
+					);
+				}
 				let result;
 				try {
 					result = await getGenModel(env)
@@ -463,18 +493,13 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 								},
 								{
 									"role": "user",
-									content: results.flatMap(
-										(r: any) => [
-											dispatchContent(`====================`),
-											dispatchContent(`${r.userName}:`),
-											dispatchContent(r.content),
-											dispatchContent(getMessageLink(r)),
-										]
-									)
+									content: modelUserContent
 								},
 								{
 									"role": "user",
-									content: `Question: ${getCommandVar(messageText, " ")}`
+									content: repliedMessage?.message_id
+										? `Question about the replied message: ${question}`
+										: `Question: ${question}`
 								}
 							],
 							max_completion_tokens: 4096,
