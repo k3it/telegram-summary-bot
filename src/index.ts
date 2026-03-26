@@ -207,6 +207,11 @@ function getCommandVar(str: string, delim: string) {
 	return str.slice(str.indexOf(delim) + delim.length);
 }
 
+function getCommandArgs(messageText: string) {
+	// Supports: /ask foo, /ask@bot foo, /askg foo, /askgroup foo
+	return messageText.replace(/^\/[^\s@]+(?:@[^\s]+)?\s*/i, "").trim();
+}
+
 function messageTemplate(s: string) {
 	return `Summary by ${escapeMarkdownV2(model)}\n` + s;
 }
@@ -321,6 +326,153 @@ function getUserName(msg: any) {
 	}
 	return msg.from?.first_name as string || "anonymous";
 }
+
+async function handleAskCommand(ctx: any, env: Env, mode: "private" | "group") {
+	const groupId = ctx.update.message!.chat.id; // numeric ID
+	const userId = ctx.update.message?.from?.id;
+	const repliedMessage = (ctx.update.message as any)?.reply_to_message;
+
+	// Check whitelist
+	const { results: whitelistResults } = await env.DB.prepare(`
+		SELECT groupId FROM WhitelistedGroups WHERE CAST(groupId AS INTEGER) = ?
+	`).bind(groupId).all();
+
+	if (!whitelistResults || whitelistResults.length === 0) {
+		await ctx.reply(`This group (ID: ${groupId}) is not whitelisted. Please contact the bot owner.`);
+		const groupName = ctx.update.message!.chat.title || 'Unknown';
+		await notifyOwnerAboutGroup(ctx.api, env, groupId, groupName);
+		return;
+	}
+
+	const messageText = ctx.update.message!.text || "";
+	const question = getCommandArgs(messageText);
+	if (!question) {
+		if (repliedMessage?.message_id) {
+			// Reply mode can work without explicit question.
+			// Keep a neutral default prompt to avoid blocking UX.
+		} else {
+			const res = (await ctx.reply('Please enter the question to ask'))!;
+			if (!res.ok) {
+				console.error(`Error sending message:`, res);
+			}
+			return;
+		}
+	}
+	if (mode === "private") {
+		if (!userId) {
+			await ctx.reply(`Unable to identify requesting user.`);
+			return;
+		}
+		const statusRes = await ctx.api.sendMessage(ctx.bot.api.toString(), {
+			"chat_id": userId,
+			"parse_mode": "MarkdownV2",
+			"text": "Bot has received your question, please wait",
+			reply_to_message_id: -1,
+		});
+		if (!statusRes.ok) {
+			await ctx.reply(`Please start a private chat with the bot, otherwise unable to receive messages`);
+			return;
+		}
+	} else {
+		await ctx.reply("Bot has received your question, please wait");
+	}
+
+	const effectiveQuestion = question || "Please explain what this replied message means in simple terms.";
+	let modelUserContent: any[] = [];
+	if (repliedMessage?.message_id) {
+		const repliedContent = repliedMessage.text || repliedMessage.caption || "[non-text message]";
+		const repliedUser = getUserName(repliedMessage);
+		const repliedLink = getMessageLink({ groupId: groupId.toString(), messageId: repliedMessage.message_id });
+		modelUserContent = [
+			dispatchContent(`The user asked /ask by replying to a specific message. Focus on the replied message and do not summarize the entire chat unless explicitly requested.`),
+			dispatchContent(`====================`),
+			dispatchContent(`${repliedUser}:`),
+			dispatchContent(repliedContent),
+			dispatchContent(repliedLink),
+			dispatchContent(`====================`),
+		];
+	} else {
+		const { results } = await env.DB.prepare(`
+			WITH latest_1000 AS (
+				SELECT * FROM Messages
+				WHERE groupId=?
+				ORDER BY timeStamp DESC
+				LIMIT 1000
+			)
+			SELECT * FROM latest_1000
+			ORDER BY timeStamp ASC
+			`)
+			.bind(groupId)
+			.all();
+		modelUserContent = results.flatMap(
+			(r: any) => [
+				dispatchContent(`====================`),
+				dispatchContent(`${r.userName}:`),
+				dispatchContent(r.content),
+				dispatchContent(getMessageLink(r)),
+			]
+		);
+	}
+
+	let result;
+	try {
+		result = await getGenModel(env)
+			.chat.completions.create({
+				model,
+				messages: [
+					{
+						"role": "system",
+						content: SYSTEM_PROMPTS.answerQuestion,
+					},
+					{
+						"role": "user",
+						content: modelUserContent
+					},
+					{
+						"role": "user",
+						content: repliedMessage?.message_id
+							? `Question about the replied message: ${effectiveQuestion}`
+							: `Question: ${effectiveQuestion}`
+					}
+				],
+				max_completion_tokens: 4096,
+				temperature
+			});
+	} catch (e) {
+		console.error(e);
+		return;
+	}
+
+	const response_text = processMarkdownLinks(telegramifyMarkdown(result.choices[0].message.content || "", 'keep'));
+
+	if (mode === "private") {
+		const finalRes = await ctx.api.sendMessage(ctx.bot.api.toString(), {
+			"chat_id": userId,
+			"parse_mode": "MarkdownV2",
+			"text": response_text,
+			reply_to_message_id: -1,
+		});
+		if (!finalRes.ok) {
+			let reason = (await finalRes.json() as any)?.promptFeedback?.blockReason;
+			if (reason) {
+				await ctx.reply(`Unable to answer, reason ${reason}`);
+				return;
+			}
+			await ctx.reply(`Send failed`);
+		}
+		return;
+	}
+
+	const groupRes = await ctx.reply(response_text, "MarkdownV2");
+	if (!groupRes?.ok) {
+		const description = (await groupRes?.json().catch(() => null))?.description || "";
+		if (description.includes("can't parse entities") || description.includes('message is too long')) {
+			await ctx.reply(escapeMarkdownV2(result.choices[0].message.content || ""), "MarkdownV2");
+			return;
+		}
+		await ctx.reply(`Send failed`);
+	}
+}
 export default {
 	async scheduled(
 		controller: ScheduledController,
@@ -406,126 +558,16 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 				}
 				return new Response('ok');
 			})
+			.on("askgroup", async (ctx) => {
+				await handleAskCommand(ctx, env, "group");
+				return new Response('ok');
+			})
+			.on("askg", async (ctx) => {
+				await handleAskCommand(ctx, env, "group");
+				return new Response('ok');
+			})
 			.on("ask", async (ctx) => {
-			const groupId = ctx.update.message!.chat.id; // numeric ID
-			const userId = ctx.update.message?.from?.id;
-			const repliedMessage = (ctx.update.message as any)?.reply_to_message;
-				
-				// Check whitelist
-				const { results: whitelistResults } = await env.DB.prepare(`
-					SELECT groupId FROM WhitelistedGroups WHERE CAST(groupId AS INTEGER) = ?
-				`).bind(groupId).all();
-
-				if (!whitelistResults || whitelistResults.length === 0) {
-				await ctx.reply(`This group (ID: ${groupId}) is not whitelisted. Please contact the bot owner.`);
-					const groupName = ctx.update.message!.chat.title || 'Unknown';
-					await notifyOwnerAboutGroup(ctx.api, env, groupId, groupName);
-					return new Response('ok');
-				}
-
-				const messageText = ctx.update.message!.text || "";
-				if (!messageText.split(" ")[1]) {
-					const res = (await ctx.reply('Please enter the question to ask'))!;
-					if (!res.ok) {
-						console.error(`Error sending message:`, res);
-					}
-					return new Response('ok');
-				}
-				if (!userId) {
-					await ctx.reply(`Unable to identify requesting user.`);
-					return new Response('ok');
-				}
-				let res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-					"chat_id": userId,
-					"parse_mode": "MarkdownV2",
-					"text": "Bot has received your question, please wait",
-					reply_to_message_id: -1,
-				});
-				if (!res.ok) {
-					await ctx.reply(`Please start a private chat with the bot, otherwise unable to receive messages`);
-					return new Response('ok');
-				}
-				const question = getCommandVar(messageText, " ");
-				let modelUserContent: any[] = [];
-				if (repliedMessage?.message_id) {
-					const repliedContent = repliedMessage.text || repliedMessage.caption || "[non-text message]";
-					const repliedUser = getUserName(repliedMessage);
-					const repliedLink = getMessageLink({ groupId: groupId.toString(), messageId: repliedMessage.message_id });
-					modelUserContent = [
-						dispatchContent(`The user asked /ask by replying to a specific message. Focus on the replied message and do not summarize the entire chat unless explicitly requested.`),
-						dispatchContent(`====================`),
-						dispatchContent(`${repliedUser}:`),
-						dispatchContent(repliedContent),
-						dispatchContent(repliedLink),
-						dispatchContent(`====================`),
-					];
-				} else {
-					const { results } = await env.DB.prepare(`
-						WITH latest_1000 AS (
-							SELECT * FROM Messages
-							WHERE groupId=?
-							ORDER BY timeStamp DESC
-							LIMIT 1000
-						)
-						SELECT * FROM latest_1000
-						ORDER BY timeStamp ASC
-						`)
-						.bind(groupId)
-						.all();
-					modelUserContent = results.flatMap(
-						(r: any) => [
-							dispatchContent(`====================`),
-							dispatchContent(`${r.userName}:`),
-							dispatchContent(r.content),
-							dispatchContent(getMessageLink(r)),
-						]
-					);
-				}
-				let result;
-				try {
-					result = await getGenModel(env)
-						.chat.completions.create({
-							model,
-							messages: [
-								{
-									"role": "system",
-									content: SYSTEM_PROMPTS.answerQuestion,
-								},
-								{
-									"role": "user",
-									content: modelUserContent
-								},
-								{
-									"role": "user",
-									content: repliedMessage?.message_id
-										? `Question about the replied message: ${question}`
-										: `Question: ${question}`
-								}
-							],
-							max_completion_tokens: 4096,
-							temperature
-						});
-				} catch (e) {
-					console.error(e);
-					return new Response('ok');
-				}
-				let response_text: string;
-				response_text = processMarkdownLinks(telegramifyMarkdown(result.choices[0].message.content || "", 'keep'));
-
-				res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-					"chat_id": userId,
-					"parse_mode": "MarkdownV2",
-					"text": response_text,
-					reply_to_message_id: -1,
-				});
-				if (!res.ok) {
-					let reason = (await res.json() as any)?.promptFeedback?.blockReason;
-					if (reason) {
-						await ctx.reply(`Unable to answer, reason ${reason}`);
-						return new Response('ok');
-					}
-					await ctx.reply(`Send failed`);
-				}
+				await handleAskCommand(ctx, env, "private");
 				return new Response('ok');
 			})
 			.on("summary", async (bot) => {
