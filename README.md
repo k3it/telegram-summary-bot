@@ -20,6 +20,8 @@ d1: <https://developers.cloudflare.com/d1/get-started/>
 
 check wiki
 
+Set `ANTHROPIC_API_KEY` if you want to use Claude models.
+
 ## Usage
 
 /summary 10
@@ -42,6 +44,18 @@ answer question based on group chat
 /status
 
 check bot is alive
+
+/model
+
+show current model and available options for this group
+
+/model claude-3.7-sonnet
+
+switch model for this group (persisted in D1)
+
+/model google:gemini-2.5-flash
+
+set a custom provider model id (`openai:...`, `google:...`, `anthropic:...`)
 
 ## Cost
 

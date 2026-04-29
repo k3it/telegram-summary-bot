@@ -118,16 +118,260 @@ type R = {
 	messageId: number;
 	timeStamp: number;
 }
-const model = "gpt-5.4-nano";
-const reasoning_effort = "none";
+
+type Provider = "openai" | "anthropic" | "google";
+type ModelConfig = {
+	provider: Provider;
+	model: string;
+	label: string;
+	noTemperature?: boolean;
+};
+
+const DEFAULT_MODEL_KEY = "gpt-5.4-nano";
+const MODEL_REGISTRY: Record<string, ModelConfig> = {
+	"gpt-5.5": { provider: "openai", model: "gpt-5.5", label: "GPT-5.5", noTemperature: true },
+	"gpt-5.5-mini": { provider: "openai", model: "gpt-5.5-mini", label: "GPT-5.5 Mini", noTemperature: true },
+	"gpt-5.4": { provider: "openai", model: "gpt-5.4", label: "GPT-5.4" },
+	"gpt-5.4-nano": { provider: "openai", model: "gpt-5.4-nano", label: "GPT-5.4 Nano" },
+	"gpt-5.4-mini": { provider: "openai", model: "gpt-5.4-mini", label: "GPT-5.4 Mini" },
+	"gpt-4.1": { provider: "openai", model: "gpt-4.1", label: "GPT-4.1" },
+	"gpt-4.1-mini": { provider: "openai", model: "gpt-4.1-mini", label: "GPT-4.1 Mini" },
+	"gpt-4.1-nano": { provider: "openai", model: "gpt-4.1-nano", label: "GPT-4.1 Nano" },
+	"o4-mini": { provider: "openai", model: "o4-mini", label: "o4-mini", noTemperature: true },
+	"o3": { provider: "openai", model: "o3", label: "o3", noTemperature: true },
+	"gemini-2.5-pro": { provider: "google", model: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+	"gemini-2.5-flash": { provider: "google", model: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+	"gemini-2.5-flash-lite": { provider: "google", model: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite" },
+	"claude-3.7-sonnet": { provider: "anthropic", model: "claude-3-7-sonnet-latest", label: "Claude 3.7 Sonnet" },
+	"claude-3.5-sonnet": { provider: "anthropic", model: "claude-3-5-sonnet-latest", label: "Claude 3.5 Sonnet" },
+	"claude-3.5-haiku": { provider: "anthropic", model: "claude-3-5-haiku-latest", label: "Claude 3.5 Haiku" },
+};
+
 const temperature = 0.4;
+
+let modelSettingsTableReady = false;
+
+function normalizeModelKey(input: string) {
+	return input.trim().toLowerCase();
+}
+
+function getModelByKey(modelKey: string) {
+	const normalized = normalizeModelKey(modelKey);
+	const modelConfig = MODEL_REGISTRY[normalized];
+	if (!modelConfig) {
+		const customMatch = normalized.match(/^(openai|google|anthropic):(.+)$/);
+		if (!customMatch) {
+			return null;
+		}
+		const provider = customMatch[1] as Provider;
+		const rawModel = customMatch[2].trim();
+		if (!rawModel) {
+			return null;
+		}
+		return {
+			modelKey: `${provider}:${rawModel}`,
+			modelConfig: {
+				provider,
+				model: rawModel,
+				label: `${provider.toUpperCase()} custom (${rawModel})`,
+			},
+		};
+	}
+	return { modelKey: normalized, modelConfig };
+}
+
+function listModelKeys() {
+	return Object.keys(MODEL_REGISTRY).sort();
+}
+
+function formatModelOptions() {
+	const grouped = {
+		openai: [] as string[],
+		google: [] as string[],
+		anthropic: [] as string[],
+	};
+	for (const key of listModelKeys()) {
+		const modelConfig = MODEL_REGISTRY[key];
+		grouped[modelConfig.provider].push(`${key} (${modelConfig.label})`);
+	}
+	return [
+		"OpenAI:",
+		...grouped.openai,
+		"",
+		"Google:",
+		...grouped.google,
+		"",
+		"Anthropic:",
+		...grouped.anthropic,
+	];
+}
+
 function getGenModel(env: Env) {
 	const openai = new OpenAI({
 		apiKey: env.OPENAI_API_KEY,
 		timeout: 999999999999,
 	});
-	const account_id = env.account_id;
 	return openai;
+}
+
+function getGoogleGenModel(env: Env) {
+	const google = new OpenAI({
+		apiKey: env.GEMINI_API_KEY,
+		baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+		timeout: 999999999999,
+	});
+	return google;
+}
+
+async function ensureModelSettingsTable(env: Env) {
+	if (modelSettingsTableReady) {
+		return;
+	}
+	await env.DB.prepare(`
+		CREATE TABLE IF NOT EXISTS GroupModelSettings (
+			groupId TEXT PRIMARY KEY,
+			modelKey TEXT NOT NULL,
+			updatedAt INTEGER NOT NULL,
+			updatedBy INTEGER
+		)
+	`).run();
+	modelSettingsTableReady = true;
+}
+
+async function getGroupModelSelection(env: Env, groupId: number) {
+	await ensureModelSettingsTable(env);
+	const selection = await env.DB.prepare(`
+		SELECT modelKey
+		FROM GroupModelSettings
+		WHERE CAST(groupId AS INTEGER) = ?
+		LIMIT 1
+	`).bind(groupId).first<{ modelKey: string }>();
+
+	if (!selection?.modelKey) {
+		const fallback = getModelByKey(DEFAULT_MODEL_KEY)!;
+		return fallback;
+	}
+	const selected = getModelByKey(selection.modelKey);
+	if (!selected) {
+		const fallback = getModelByKey(DEFAULT_MODEL_KEY)!;
+		return fallback;
+	}
+	return selected;
+}
+
+async function setGroupModelSelection(env: Env, groupId: number, modelKey: string, updatedBy?: number) {
+	await ensureModelSettingsTable(env);
+	await env.DB.prepare(`
+		INSERT OR REPLACE INTO GroupModelSettings(groupId, modelKey, updatedAt, updatedBy)
+		VALUES (CAST(? AS INTEGER), ?, ?, ?)
+	`).bind(groupId, modelKey, Date.now(), updatedBy ?? null).run();
+}
+
+type DispatchContent = ReturnType<typeof dispatchContent>;
+type ChatMessage = {
+	role: "system" | "user" | "assistant";
+	content: string | DispatchContent[];
+};
+
+type AnthropicContentBlock =
+	| { type: "text"; text: string }
+	| {
+		type: "image";
+		source: {
+			type: "base64";
+			media_type: string;
+			data: string;
+		};
+	};
+
+function toAnthropicContent(content: string | DispatchContent[]): AnthropicContentBlock[] {
+	if (typeof content === "string") {
+		return [{ type: "text", text: content }];
+	}
+	const blocks: AnthropicContentBlock[] = [];
+	for (const block of content) {
+		if (block.type === "text") {
+			blocks.push({ type: "text", text: block.text });
+			continue;
+		}
+		const imageUrl = block.image_url.url;
+		const dataUrlMatch = imageUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+		if (!dataUrlMatch) {
+			continue;
+		}
+		blocks.push({
+			type: "image",
+			source: {
+				type: "base64",
+				media_type: dataUrlMatch[1],
+				data: dataUrlMatch[2],
+			},
+		});
+	}
+	return blocks;
+}
+
+async function createModelResponse(
+	env: Env,
+	selectedModel: { modelKey: string, modelConfig: ModelConfig },
+	messages: ChatMessage[],
+	maxTokens = 4096,
+) {
+	if (selectedModel.modelConfig.provider === "openai" || selectedModel.modelConfig.provider === "google") {
+		if (selectedModel.modelConfig.provider === "google" && !env.GEMINI_API_KEY) {
+			throw new Error("GEMINI_API_KEY is not configured.");
+		}
+		const client = selectedModel.modelConfig.provider === "google" ? getGoogleGenModel(env) : getGenModel(env);
+		const response = await client.chat.completions.create({
+			model: selectedModel.modelConfig.model,
+			messages: messages as any,
+			max_completion_tokens: maxTokens,
+			...(selectedModel.modelConfig.noTemperature ? {} : { temperature }),
+		});
+		return response.choices[0].message.content || "";
+	}
+
+	if (!env.ANTHROPIC_API_KEY) {
+		throw new Error("ANTHROPIC_API_KEY is not configured.");
+	}
+
+	const systemContent = messages
+		.filter((m) => m.role === "system")
+		.map((m) => (typeof m.content === "string" ? m.content : ""))
+		.filter(Boolean)
+		.join("\n\n");
+	const conversation = messages
+		.filter((m) => m.role !== "system")
+		.map((m) => ({
+			role: m.role,
+			content: toAnthropicContent(m.content),
+		}));
+
+	const response = await fetch("https://api.anthropic.com/v1/messages", {
+		method: "POST",
+		headers: {
+			"x-api-key": env.ANTHROPIC_API_KEY,
+			"anthropic-version": "2023-06-01",
+			"content-type": "application/json",
+		},
+		body: JSON.stringify({
+			model: selectedModel.modelConfig.model,
+			system: systemContent,
+			messages: conversation,
+			max_tokens: maxTokens,
+			temperature,
+		}),
+	});
+	if (!response.ok) {
+		throw new Error(`Anthropic request failed: ${response.status} ${await response.text()}`);
+	}
+	const data = await response.json<any>();
+	const text = (data?.content || [])
+		.filter((c: any) => c?.type === "text")
+		.map((c: any) => c?.text || "")
+		.join("\n")
+		.trim();
+	return text;
 }
 
 function foldText(text: string) {
@@ -142,7 +386,7 @@ async function notifyOwnerAboutGroup(bot: TelegramApi, env: Env, groupId: number
 
 	try {
 		const ownerUserId = parseInt(env.OWNER_ID);
-		await bot.sendMessage(ownerUserId, 
+		await (bot as any).sendMessage(ownerUserId,
 			`Bot received message from non-whitelisted group: ${groupName} (ID: ${groupId})\n\nUse /whitelist ${groupId} to approve this group for processing.`
 		);
 		notifiedGroups.add(groupId);
@@ -207,8 +451,8 @@ function getCommandVar(str: string, delim: string) {
 	return str.slice(str.indexOf(delim) + delim.length);
 }
 
-function messageTemplate(s: string) {
-	return `Summary by ${escapeMarkdownV2(model)}\n` + s;
+function messageTemplate(s: string, modelName: string) {
+	return `Summary by ${escapeMarkdownV2(modelName)}\n` + s;
 }
 
 function splitTelegramMessage(text: string, maxLen = 3900) {
@@ -435,10 +679,11 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 					await ctx.reply(`Unable to identify requesting user.`);
 					return new Response('ok');
 				}
+				const selectedModel = await getGroupModelSelection(env, groupId);
 				let res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
 					"chat_id": userId,
 					"parse_mode": "MarkdownV2",
-					"text": "Bot has received your question, please wait",
+					"text": `Bot has received your question, please wait. Using model: ${selectedModel.modelKey}`,
 					reply_to_message_id: -1,
 				});
 				if (!res.ok) {
@@ -481,36 +726,36 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 						]
 					);
 				}
-				let result;
+				let answerText = "";
 				try {
-					result = await getGenModel(env)
-						.chat.completions.create({
-							model,
-							messages: [
-								{
-									"role": "system",
-									content: SYSTEM_PROMPTS.answerQuestion,
-								},
-								{
-									"role": "user",
-									content: modelUserContent
-								},
-								{
-									"role": "user",
-									content: repliedMessage?.message_id
-										? `Question about the replied message: ${question}`
-										: `Question: ${question}`
-								}
-							],
-							max_completion_tokens: 4096,
-							temperature
-						});
+					answerText = await createModelResponse(
+						env,
+						selectedModel,
+						[
+							{
+								role: "system",
+								content: SYSTEM_PROMPTS.answerQuestion,
+							},
+							{
+								role: "user",
+								content: modelUserContent,
+							},
+							{
+								role: "user",
+								content: repliedMessage?.message_id
+									? `Question about the replied message: ${question}`
+									: `Question: ${question}`,
+							},
+						],
+						4096,
+					);
 				} catch (e) {
 					console.error(e);
+					await ctx.reply(`Model call failed: ${(e as Error).message}`);
 					return new Response('ok');
 				}
 				let response_text: string;
-				response_text = processMarkdownLinks(telegramifyMarkdown(result.choices[0].message.content || "", 'keep'));
+				response_text = processMarkdownLinks(telegramifyMarkdown(answerText || "", 'keep'));
 
 				res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
 					"chat_id": userId,
@@ -593,6 +838,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 				}
 				if (results.length > 0) {
 					try {
+						const selectedModel = await getGroupModelSelection(env, groupId);
 						// Calculate actual time frame from messages
 						const firstMessageTime = getSendTime(results[0] as R);
 						const lastMessageTime = getSendTime(results[results.length - 1] as R);
@@ -606,52 +852,101 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 							summaryHeader = `Chat summary of the last ${results.length} messages\nTime frame: ${firstMessageTime} to ${lastMessageTime}`;
 						}
 
-						const result = await getGenModel(env).chat.completions.create(
-							{
-								model,
-								// reasoning_effort,
-								messages: [
-									{
-										"role": "system",
-										content: SYSTEM_PROMPTS.summarizeChat,
-									},
-									{
-										"role": "user",
-										content: [
-											dispatchContent(`Please summarize this chat history.\n${summaryHeader}`),
-											...results.flatMap(
-												(r: any) => [
-													dispatchContent(`====================`),
-													dispatchContent(`${r.userName}:`),
-													dispatchContent(r.content),
-													dispatchContent(getMessageLink(r)),
-												]
-											)
-										]
-									}
-								],
-							max_completion_tokens: 4096,
-							temperature
-						})
+						const rawSummary = await createModelResponse(
+							env,
+							selectedModel,
+							[
+								{
+									role: "system",
+									content: SYSTEM_PROMPTS.summarizeChat,
+								},
+								{
+									role: "user",
+									content: [
+										dispatchContent(`Please summarize this chat history.\n${summaryHeader}`),
+										...results.flatMap(
+											(r: any) => [
+												dispatchContent(`====================`),
+												dispatchContent(`${r.userName}:`),
+												dispatchContent(r.content),
+												dispatchContent(getMessageLink(r)),
+											]
+										),
+									],
+								},
+							],
+							4096,
+						);
 
-						const rawSummary = result.choices[0].message.content || "";
 						const summaryText = messageTemplate(
 							formatSummaryAsTopicCards(
 								fixLink(
-									processMarkdownLinks(telegramifyMarkdown(rawSummary, 'escape')))));
-						await sendSummaryText(bot, summaryText, `Summary by ${model}\n${rawSummary}`);
+									processMarkdownLinks(telegramifyMarkdown(rawSummary, 'escape')))),
+							selectedModel.modelKey);
+						await sendSummaryText(bot, summaryText, `Summary by ${selectedModel.modelKey}\n${rawSummary}`);
 					}
 					catch (e) {
 						console.error(e);
+						await bot.reply(`Summary failed: ${(e as Error).message}`);
 					}
 				}
 
 				return new Response('ok');
 			})
+			.on("model", async (ctx) => {
+				const chat = ctx.update.message?.chat;
+				if (!chat || !chat.type.includes('group')) {
+					await ctx.reply('Please use /model in a group chat.');
+					return new Response('ok');
+				}
+				const groupId = chat.id;
+				const { results: whitelistResults } = await env.DB.prepare(`
+					SELECT groupId FROM WhitelistedGroups WHERE CAST(groupId AS INTEGER) = ?
+				`).bind(groupId).all();
+
+				if (!whitelistResults || whitelistResults.length === 0) {
+					await ctx.reply(`This group (ID: ${groupId}) is not whitelisted. Please contact the bot owner.`);
+					const groupName = chat.title || 'Unknown';
+					await notifyOwnerAboutGroup(ctx.api, env, groupId, groupName);
+					return new Response('ok');
+				}
+
+				const messageText = (ctx.update.message?.text || "").trim();
+				const arg = messageText.split(/\s+/)[1]?.trim();
+				const current = await getGroupModelSelection(env, groupId);
+
+				if (!arg || arg.toLowerCase() === "list") {
+					await ctx.reply(
+						`Current model: ${current.modelKey}\nAvailable models:\n${formatModelOptions().join("\n")}\n\nUse /model <model-key> to switch.\nCustom format: /model openai:<model> or /model google:<model> or /model anthropic:<model>`
+					);
+					return new Response('ok');
+				}
+
+				const requested = getModelByKey(arg);
+				if (!requested) {
+					await ctx.reply(
+						`Unknown model: ${arg}\nAvailable models:\n${formatModelOptions().join("\n")}\n\nCustom format: /model openai:<model> or /model google:<model> or /model anthropic:<model>`
+					);
+					return new Response('ok');
+				}
+				if (requested.modelConfig.provider === "anthropic" && !env.ANTHROPIC_API_KEY) {
+					await ctx.reply("ANTHROPIC_API_KEY is not configured. Add it before selecting Claude models.");
+					return new Response('ok');
+				}
+				if (requested.modelConfig.provider === "google" && !env.GEMINI_API_KEY) {
+					await ctx.reply("GEMINI_API_KEY is not configured. Add it before selecting Gemini models.");
+					return new Response('ok');
+				}
+
+				await setGroupModelSelection(env, groupId, requested.modelKey, ctx.update.message?.from?.id);
+				await ctx.reply(`Model updated to ${requested.modelKey} (${requested.modelConfig.label}).`);
+				return new Response('ok');
+			})
 			.on('my_chat_member', async (ctx) => {
-				console.debug('my_chat_member event triggered:', ctx.update.my_chat_member);
+				const myChatMemberUpdate = (ctx.update as any).my_chat_member;
+				console.debug('my_chat_member event triggered:', myChatMemberUpdate);
 				// Triggered when bot is added/removed from a group
-				const my_chat_member = ctx.update.my_chat_member!;
+				const my_chat_member = myChatMemberUpdate;
 				const groupId = my_chat_member.chat.id;
 				const groupName = my_chat_member.chat.title || 'Unknown';
 				const newStatus = my_chat_member.new_chat_member.status;
@@ -665,7 +960,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 					const ownerUserId = parseInt(env.OWNER_ID);
 					console.debug(`Attempting to notify owner ${ownerUserId} about group ${groupId}`);
 					try {
-						await ctx.api.sendMessage(ownerUserId, 
+						await (ctx.api as any).sendMessage(ownerUserId,
 							`Bot added to new group: ${groupName} (ID: ${groupId})\n\nUse /whitelist ${groupId} to approve this group for processing.`
 						);
 						console.debug('Owner notification sent successfully');

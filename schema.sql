@@ -15,3 +15,10 @@ CREATE TABLE IF NOT EXISTS WhitelistedGroups (
 	groupName TEXT,
 	whitelistedAt INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS GroupModelSettings (
+	groupId TEXT PRIMARY KEY,
+	modelKey TEXT NOT NULL,
+	updatedAt INTEGER NOT NULL,
+	updatedBy INTEGER
+);
