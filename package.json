@@ -10,18 +10,19 @@
     "cf-typegen": "wrangler types"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.14.0",
+    "@cloudflare/vitest-pool-workers": "^0.16.15",
     "@cloudflare/workers-types": "^4.20241112.0",
     "typescript": "^5.5.2",
-    "vitest": "^2.1.9",
-    "wrangler": "^4.79.0"
+    "vitest": "^4.1.9",
+    "wrangler": "^4.100.0"
   },
   "dependencies": {
     "@codebam/cf-workers-telegram-bot": "^7.27.0",
-    "openai": "^6.32.0",
-    "telegramify-markdown": "^1.2.2"
+    "openai": "^6.32.0"
   },
   "overrides": {
-    "is-core-module": "npm:@nolyfill/is-core-module@^1"
+    "is-core-module": "npm:@nolyfill/is-core-module@^1",
+    "ws": "^8.21.0",
+    "esbuild": "^0.28.1"
   }
 }
