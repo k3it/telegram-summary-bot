@@ -1,7 +1,6 @@
 import TelegramBot, { TelegramApi } from '@codebam/cf-workers-telegram-bot';
 import OpenAI from "openai";
 
-import telegramifyMarkdown from "telegramify-markdown"
 //@ts-ignore
 import { Buffer } from 'node:buffer';
 import { isJPEGBase64 } from './isJpeg';
@@ -374,10 +373,6 @@ async function createModelResponse(
 	return text;
 }
 
-function foldText(text: string) {
-	return text.split("\n").map((line) => '>' + line).join("\n");
-}
-
 // Notify owner about non-whitelisted group (only once per deployment)
 async function notifyOwnerAboutGroup(bot: TelegramApi, env: Env, groupId: number, groupName: string) {
 	if (notifiedGroups.has(groupId)) {
@@ -408,23 +403,16 @@ Associated link
 ====================
 
 Follow these guidelines:
-1. If multiple topics are discussed, summarize them as separate sections in the summary, clearly indicating topic shifts
-2. If images are mentioned, include relevant descriptions in the summary
-3. Use markdown format to reference original messages with links
-4. Link format should be: [Keyword1](URL), etc.   prefer to use keyword as link text if possible, but if not, just use Ref + number.
-5. Keep the summary concise while capturing key content and sentiment
-6. Start the summary with the time frame and message count information provided
-7. Output must be entirely in English, but ok to include non-English content from the chat in the summary as long as the summary itself is in English
-8. For each section of the summary add a very brief AI opinion on the discussion, but clearly indicate that it's an opinion from the AI
-9. Use proper markdown formatting to enhance readability, but avoid nested bullet lists and avoid blockquotes.
-10. Keep the total response within 256 words, and try to be as concise as possible while following the above guidelines.
-11. Use this structure for readability:
-    - First line: one compact time/message-count line.
-    - Then sections titled exactly like: "Topic 1: ...", "Topic 2: ..."
-    - For each topic, use normal paragraph flow with short paragraphs and inline links.
-    - Put only the single "AI opinion:" line in a fenced code block (\`\`\` ... \`\`\`).
-    - Do not separate links into their own bullet list; flow them naturally with the relevant sentence.
-12. Keep lines natural sentence flow; do not break every sentence into a new line.`,
+1. If multiple topics are discussed, summarize them as separate sections, clearly indicating topic shifts. Give each topic its own heading (e.g. "Topic 1: ...", "Topic 2: ...").
+2. If images are mentioned, include relevant descriptions in the summary.
+3. Reference original messages with inline links: [keyword](URL). Prefer a meaningful keyword as the link text; if none fits, use Ref + number. ALWAYS include the actual URL in parentheses — never output a bare "[Ref]" or "[link]" without its URL.
+4. Keep the summary concise while capturing key content and sentiment.
+5. Start the summary with the one-line time frame and message count information provided in the request.
+6. Output must be entirely in English, but it is fine to quote non-English content from the chat as long as the summary itself is in English.
+7. For each topic add a brief note labeled "AI context:" — 1-2 factual, useful pieces of information relevant to the topic (background facts, current data, clarifications, or counterpoints from general knowledge). Do NOT comment on the tone, humor, or sentiment of the conversation.
+8. Keep the total response within ~256 words and be as concise as possible.
+
+Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`,
 
   answerQuestion: `You are an intelligent group chat assistant. Your task is to answer user questions based on the provided chat history, in English only.
 
@@ -435,66 +423,50 @@ Message content
 Associated link
 ====================
 
-1. If multiple topics are discussed, summarize them as separate sections in the summary, clearly indicating topic shifts
-2. If images are mentioned, include relevant descriptions in the summary
-3. Use markdown format to reference original messages with links
-4. Link format should be: [Keyword1](URL), etc.   prefer to use keyword as link text if possible, but if not, just use Ref + number.
-5. Keep the summary concise while capturing key content and sentiment
-6. Start the summary with the time frame and message count information provided
-7. Output must be entirely in English, but ok to include non-English content from the chat in the summary as long as the summary itself is in English
-9. Use proper markdown formatting to enhance readability, but avoid nested bullet lists and avoid blockquotes.
-10. Keep the total response within 256 words, and try to be as concise as possible while following the above guidelines.
-11. Prefer compact paragraphs over list-heavy formatting unless the user explicitly asks for bullets.`
+Follow these guidelines:
+1. Answer the question directly and concisely based on the chat history.
+2. If images are mentioned, include relevant descriptions where relevant.
+3. Reference original messages with inline links: [keyword](URL). Prefer a meaningful keyword as the link text; if none fits, use Ref + number. ALWAYS include the actual URL in parentheses — never output a bare "[Ref]" or "[link]" without its URL.
+4. Output must be entirely in English, but it is fine to quote non-English content from the chat as long as the answer itself is in English.
+5. Keep the answer concise (within ~256 words) unless the question genuinely requires more detail.
+
+Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`
 };
 
 function getCommandVar(str: string, delim: string) {
 	return str.slice(str.indexOf(delim) + delim.length);
 }
 
-function messageTemplate(s: string, modelName: string) {
-	return `Summary by ${escapeMarkdownV2(modelName)}\n` + s;
-}
-
-function splitTelegramMessage(text: string, maxLen = 3900) {
-	const chunks: string[] = [];
-	let remaining = text;
-	while (remaining.length > maxLen) {
-		let splitIndex = remaining.lastIndexOf('\n', maxLen);
-		if (splitIndex <= 0) {
-			splitIndex = maxLen;
-		}
-		chunks.push(remaining.slice(0, splitIndex));
-		remaining = remaining.slice(splitIndex);
+/**
+ * Send a message as Telegram rich content (Bot API 10.1 sendRichMessage).
+ * The model's GitHub-Flavored Markdown is passed verbatim in rich_message.markdown
+ * and parsed into rich blocks server-side — no MarkdownV2 escaping required.
+ * Returns { ok } so callers can show a notice on failure (no fallback by design).
+ */
+async function sendRichMessage(
+	env: Env,
+	chatId: number | string,
+	markdown: string,
+	replyToMessageId?: number,
+): Promise<{ ok: boolean; description?: string }> {
+	const body: Record<string, unknown> = {
+		chat_id: chatId,
+		rich_message: { markdown },
+	};
+	if (replyToMessageId !== undefined) {
+		body.reply_parameters = { message_id: replyToMessageId };
 	}
-	if (remaining.length > 0) {
-		chunks.push(remaining);
+	const res = await fetch(`https://api.telegram.org/bot${env.SECRET_TELEGRAM_API_TOKEN}/sendRichMessage`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	const data = await res.json<any>().catch(() => null);
+	if (!data?.ok) {
+		console.error("sendRichMessage failed", res.status, JSON.stringify(data?.description));
+		return { ok: false, description: data?.description };
 	}
-	return chunks;
-}
-
-async function sendSummaryText(bot: any, text: string, fallbackRawText?: string) {
-	const chunks = splitTelegramMessage(text, 3900);
-	for (const chunk of chunks) {
-		const res = await bot.reply(chunk, 'MarkdownV2');
-		if (!res?.ok) {
-			const body = await res.json().catch(() => null);
-			const description = body?.description || '';
-			if (description.includes("can't parse entities") || description.includes('message is too long')) {
-				// Fallback to fully escaped MarkdownV2 text to keep output readable and stable.
-				const safeText = escapeMarkdownV2(fallbackRawText ?? text);
-				const safeChunks = splitTelegramMessage(safeText, 3900);
-				for (const safeChunk of safeChunks) {
-					const fallbackRes = await bot.reply(safeChunk, 'MarkdownV2');
-					if (!fallbackRes?.ok) {
-						console.error('Fallback safe MarkdownV2 reply failed', await fallbackRes?.text());
-					}
-				}
-				return;
-			}
-			console.error('Failed to send reply', res?.statusText, await res?.text());
-			return;
-		}
-	}
+	return { ok: true };
 }
 
 /**
@@ -507,58 +479,6 @@ function fixLink(text: string) {
 	return text.replace(/tme\.cat/g, "t.me/c").replace(/\/c\/c/g, "/c");
 }
 
-function formatSummaryAsTopicCards(text: string) {
-	const sanitized = text
-		// Remove any existing markdown fences the model may emit (escaped or unescaped).
-		.replace(/^\s*```[^\n]*\s*$/gm, "")
-		.replace(/^\s*\\`\\`\\`[^\n]*\s*$/gm, "")
-		.replace(/^\s*(?:\\`){3}[^\n]*\s*$/gm, "");
-	const lines = sanitized.replace(/\r\n/g, "\n").split("\n");
-	const topicHeaderRegex = /^\*?\s*Topic\s+\d+\s*:/i;
-	const topicIndexes: number[] = [];
-
-	for (let i = 0; i < lines.length; i++) {
-		if (topicHeaderRegex.test(lines[i].trim())) {
-			topicIndexes.push(i);
-		}
-	}
-
-	if (topicIndexes.length === 0) {
-		return text;
-	}
-
-	const intro = lines.slice(0, topicIndexes[0]).join("\n").trim();
-	const sections: string[] = [];
-
-	for (let i = 0; i < topicIndexes.length; i++) {
-		const start = topicIndexes[i];
-		const end = i + 1 < topicIndexes.length ? topicIndexes[i + 1] : lines.length;
-		const chunk = lines.slice(start, end);
-		const header = (chunk[0] || "").trim();
-		const bodyLines = chunk.slice(1);
-
-		let body = bodyLines.join("\n").trim();
-		if (!body) {
-			body = "No additional details.";
-		}
-		body = body.replace(/```/g, "'''");
-		const headerNoStars = header.replace(/^\*+/, "").replace(/\*+$/, "").trim();
-		const renderHeader = `*${headerNoStars}*`;
-
-		// Keep normal flow, but render AI opinion as a code block for visual emphasis.
-		const aiOpinionPattern = /(^|\n)(\*?\s*AI opinion:\*?\s*[^\n]*)/gi;
-		const bodyWithCodeOpinion = body.replace(aiOpinionPattern, (_m, prefix, opinionLine) => {
-			const unescaped = opinionLine
-				.replace(/\\([_\*\[\]\(\)~`>#+\-=|{}.!])/g, "$1")
-				.replace(/\\\\/g, "\\");
-			return `${prefix}\`\`\`\n${unescaped}\n\`\`\``;
-		});
-
-		sections.push(`${renderHeader}\n\n${bodyWithCodeOpinion}`.trim());
-	}
-
-	return `${intro}\n\n${sections.join("\n\n")}`.trim();
-}
 function getUserName(msg: any) {
 	if (msg?.sender_chat?.title) {
 		return msg.sender_chat.title as string;
@@ -682,7 +602,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 				const selectedModel = await getGroupModelSelection(env, groupId);
 				let res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
 					"chat_id": userId,
-					"parse_mode": "MarkdownV2",
+					"parse_mode": "",
 					"text": `Bot has received your question, please wait. Using model: ${selectedModel.modelKey}`,
 					reply_to_message_id: -1,
 				});
@@ -754,22 +674,10 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 					await ctx.reply(`Model call failed: ${(e as Error).message}`);
 					return new Response('ok');
 				}
-				let response_text: string;
-				response_text = processMarkdownLinks(telegramifyMarkdown(answerText || "", 'keep'));
-
-				res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-					"chat_id": userId,
-					"parse_mode": "MarkdownV2",
-					"text": response_text,
-					reply_to_message_id: -1,
-				});
-				if (!res.ok) {
-					let reason = (await res.json() as any)?.promptFeedback?.blockReason;
-					if (reason) {
-						await ctx.reply(`Unable to answer, reason ${reason}`);
-						return new Response('ok');
-					}
-					await ctx.reply(`Send failed`);
+				// Send the model's GitHub-Flavored Markdown verbatim as a rich message.
+				const sent = await sendRichMessage(env, userId, fixLink(answerText || ""));
+				if (!sent.ok) {
+					await ctx.reply(`⚠️ Unable to generate enhanced markdown.`);
 				}
 				return new Response('ok');
 			})
@@ -878,12 +786,12 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 							4096,
 						);
 
-						const summaryText = messageTemplate(
-							formatSummaryAsTopicCards(
-								fixLink(
-									processMarkdownLinks(telegramifyMarkdown(rawSummary, 'escape')))),
-							selectedModel.modelKey);
-						await sendSummaryText(bot, summaryText, `Summary by ${selectedModel.modelKey}\n${rawSummary}`);
+						// Pass the model's GitHub-Flavored Markdown verbatim to Telegram as a rich message.
+						const summaryMarkdown = `**Summary by ${selectedModel.modelKey}**\n\n${fixLink(rawSummary)}`;
+						const sent = await sendRichMessage(env, groupId, summaryMarkdown, bot.update.message!.message_id);
+						if (!sent.ok) {
+							await bot.reply(`⚠️ Unable to generate enhanced markdown.`);
+						}
 					}
 					catch (e) {
 						console.error(e);
