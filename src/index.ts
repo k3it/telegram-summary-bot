@@ -409,10 +409,10 @@ Follow these guidelines:
 4. Keep the summary concise while capturing key content and sentiment.
 5. Start the summary with the one-line time frame and message count information provided in the request.
 6. Output must be entirely in English, but it is fine to quote non-English content from the chat as long as the summary itself is in English.
-7. For each topic add a brief note labeled "AI context:" — 1-2 factual, useful pieces of information relevant to the topic (background facts, current data, clarifications, or counterpoints from general knowledge). Do NOT comment on the tone, humor, or sentiment of the conversation.
+7. For each topic add a brief bullet paragraph offset note labeled "AI context:" — 1-2 factual, useful pieces of information relevant to the topic (background facts, current data, clarifications, or counterpoints from general knowledge). Do NOT comment on the tone, humor, or sentiment of the conversation.
 8. Keep the total response within ~256 words and be as concise as possible.
 
-Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`,
+Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — text color, headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links, and markdown color. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`,
 
   answerQuestion: `You are an intelligent group chat assistant. Your task is to answer user questions based on the provided chat history, in English only.
 
@@ -430,7 +430,7 @@ Follow these guidelines:
 4. Output must be entirely in English, but it is fine to quote non-English content from the chat as long as the answer itself is in English.
 5. Keep the answer concise (within ~256 words) unless the question genuinely requires more detail.
 
-Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`
+Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — text color, headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`
 };
 
 function getCommandVar(str: string, delim: string) {
