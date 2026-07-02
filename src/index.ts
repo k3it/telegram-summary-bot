@@ -712,8 +712,11 @@ async function generateSummaryImage(
 	env: Env,
 	imageSelection: { modelKey: string, modelConfig: ImageModelConfig },
 	summaryText: string,
+	persona: string | null = null,
 ): Promise<ImageBytes | null> {
-	const prompt = `create an image for the following summary\n\n${summaryText}`;
+	const prompt = persona
+		? `${persona}\n\ncreate an image for the following summary\n\n${summaryText}`
+		: `create an image for the following summary\n\n${summaryText}`;
 	try {
 		if (imageSelection.modelConfig.provider === "google") {
 			if (!env.GEMINI_API_KEY) {
@@ -1102,7 +1105,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 						const imageSelection = await getGroupImageModelSelection(env, groupId);
 						const imageModelConfig = imageSelection.modelConfig;
 						const imageBytes = imageModelConfig
-							? await generateSummaryImage(env, { modelKey: imageSelection.modelKey, modelConfig: imageModelConfig }, plainSummaryMarkdown)
+							? await generateSummaryImage(env, { modelKey: imageSelection.modelKey, modelConfig: imageModelConfig }, plainSummaryMarkdown, persona)
 							: null;
 						// Uploaded to our own R2 bucket (group-scoped, unguessable filename) so it can be
 						// embedded as a plain HTTPS URL — attach://-style multipart uploads to sendRichMessage
