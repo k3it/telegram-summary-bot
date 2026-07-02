@@ -5,7 +5,12 @@ interface Env {
 	OPENAI_API_KEY: string;
 	ANTHROPIC_API_KEY?: string;
 	GEMINI_API_KEY?: string;
-	account_id: string;
+	WORKER_AI_TOKEN: string;
+	CF_ACCOUNT_ID: string;
+	AI_GATEWAY_ID: string;
+	R2_PUBLIC_URL: string;
+	AI: Ai;
 	DB: D1Database;
+	SUMMARY_IMAGES: R2Bucket;
 	OWNER_ID: string;
 }

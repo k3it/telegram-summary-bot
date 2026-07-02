@@ -6,7 +6,7 @@
 
 Feel scared when seeing 2000+ unread in groups? Now you can read them by LLM!
 
-Use d1, cf worker, ai gateway, gemini-2.5-flash.
+Use d1, cf worker, ai gateway, gemini-3.5-flash.
 
 ## NOTICE
 
@@ -20,7 +20,9 @@ d1: <https://developers.cloudflare.com/d1/get-started/>
 
 check wiki
 
-Set `ANTHROPIC_API_KEY` if you want to use Claude models.
+All model calls (OpenAI/Google/Anthropic) are routed through Cloudflare AI Gateway; set `WORKER_AI_TOKEN` (a Cloudflare API token), `CF_ACCOUNT_ID`, and `AI_GATEWAY_ID`. Set `ANTHROPIC_API_KEY` if you want to use Claude models. `@cf/*` Workers AI models route via the `AI` binding directly, no key needed.
+
+`/summary` illustrations are generated then uploaded to the `SUMMARY_IMAGES` R2 bucket (keyed `<groupId>/<random14charstring>.<ext>`) and embedded via its public r2.dev URL (`R2_PUBLIC_URL`) — Telegram's `sendRichMessage` doesn't support attaching raw file bytes, only a real HTTPS image URL in markdown. The r2.dev dev URL is rate-limited; switch to a custom domain on the bucket if a group's summary traffic outgrows it.
 
 ## Usage
 
@@ -55,7 +57,19 @@ switch model for this group (persisted in D1)
 
 /model google:gemini-2.5-flash
 
-set a custom provider model id (`openai:...`, `google:...`, `anthropic:...`)
+set a custom provider model id (`openai:...`, `google:...`, `anthropic:...`, `workers-ai:...`)
+
+/imagemodel
+
+show current image model and available options for this group (used by `/summary` to illustrate the summary)
+
+/imagemodel nano-banana-2
+
+switch image model for this group (persisted in D1)
+
+/imagemodel off
+
+disable image generation for `/summary` in this group
 
 ## Cost
 
@@ -65,7 +79,7 @@ d1: telegram bot can't read info in the history, only newly sent info, so use da
 
 cf worker: so no more offline.(I hope so) [pricing](https://developers.cloudflare.com/workers/platform/pricing/#workers)
 
-gemini-2.5-flash: free for limited usage and huge context
+gemini-3.5-flash: free for limited usage and huge context
 
 ---
 

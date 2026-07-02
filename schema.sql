@@ -22,3 +22,10 @@ CREATE TABLE IF NOT EXISTS GroupModelSettings (
 	updatedAt INTEGER NOT NULL,
 	updatedBy INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS GroupImageModelSettings (
+	groupId TEXT PRIMARY KEY,
+	modelKey TEXT NOT NULL,
+	updatedAt INTEGER NOT NULL,
+	updatedBy INTEGER
+);

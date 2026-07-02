@@ -118,7 +118,7 @@ type R = {
 	timeStamp: number;
 }
 
-type Provider = "openai" | "anthropic" | "google";
+type Provider = "openai" | "anthropic" | "google" | "workers-ai";
 type ModelConfig = {
 	provider: Provider;
 	model: string;
@@ -126,7 +126,14 @@ type ModelConfig = {
 	noTemperature?: boolean;
 };
 
-const DEFAULT_MODEL_KEY = "gpt-5.4-nano";
+// Provider -> AI Gateway compat-endpoint slug (workers-ai routes via the AI binding instead).
+export const GATEWAY_PROVIDER_SLUG: Record<Exclude<Provider, "workers-ai">, string> = {
+	openai: "openai",
+	google: "google-ai-studio",
+	anthropic: "anthropic",
+};
+
+const DEFAULT_MODEL_KEY = "gemini-3.5-flash";
 const MODEL_REGISTRY: Record<string, ModelConfig> = {
 	"gpt-5.5": { provider: "openai", model: "gpt-5.5", label: "GPT-5.5", noTemperature: true },
 	"gpt-5.5-mini": { provider: "openai", model: "gpt-5.5-mini", label: "GPT-5.5 Mini", noTemperature: true },
@@ -138,6 +145,7 @@ const MODEL_REGISTRY: Record<string, ModelConfig> = {
 	"gpt-4.1-nano": { provider: "openai", model: "gpt-4.1-nano", label: "GPT-4.1 Nano" },
 	"o4-mini": { provider: "openai", model: "o4-mini", label: "o4-mini", noTemperature: true },
 	"o3": { provider: "openai", model: "o3", label: "o3", noTemperature: true },
+	"gemini-3.5-flash": { provider: "google", model: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
 	"gemini-2.5-pro": { provider: "google", model: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
 	"gemini-2.5-flash": { provider: "google", model: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
 	"gemini-2.5-flash-lite": { provider: "google", model: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite" },
@@ -154,11 +162,11 @@ function normalizeModelKey(input: string) {
 	return input.trim().toLowerCase();
 }
 
-function getModelByKey(modelKey: string) {
+export function getModelByKey(modelKey: string) {
 	const normalized = normalizeModelKey(modelKey);
 	const modelConfig = MODEL_REGISTRY[normalized];
 	if (!modelConfig) {
-		const customMatch = normalized.match(/^(openai|google|anthropic):(.+)$/);
+		const customMatch = normalized.match(/^(openai|google|anthropic|workers-ai):(.+)$/);
 		if (!customMatch) {
 			return null;
 		}
@@ -188,6 +196,7 @@ function formatModelOptions() {
 		openai: [] as string[],
 		google: [] as string[],
 		anthropic: [] as string[],
+		"workers-ai": [] as string[],
 	};
 	for (const key of listModelKeys()) {
 		const modelConfig = MODEL_REGISTRY[key];
@@ -202,24 +211,32 @@ function formatModelOptions() {
 		"",
 		"Anthropic:",
 		...grouped.anthropic,
+		...(grouped["workers-ai"].length ? ["", "Workers AI:", ...grouped["workers-ai"]] : []),
 	];
 }
 
-function getGenModel(env: Env) {
-	const openai = new OpenAI({
-		apiKey: env.OPENAI_API_KEY,
-		timeout: 999999999999,
+// Single OpenAI-SDK client pointed at the AI Gateway OpenAI-compat endpoint. Every
+// external-provider call (openai/google/anthropic) goes through this — no more direct
+// calls to api.openai.com / generativelanguage.googleapis.com / api.anthropic.com.
+// Docs: https://developers.cloudflare.com/ai-gateway/usage/chat-completion/
+function getGatewayClient(env: Env) {
+	return new OpenAI({
+		apiKey: env.WORKER_AI_TOKEN, // placeholder; the real per-provider key is sent per-request below
+		baseURL: `https://gateway.ai.cloudflare.com/v1/${env.CF_ACCOUNT_ID}/${env.AI_GATEWAY_ID}/compat`,
+		defaultHeaders: { "cf-aig-authorization": `Bearer ${env.WORKER_AI_TOKEN}` },
+		timeout: 120_000,
 	});
-	return openai;
 }
 
-function getGoogleGenModel(env: Env) {
-	const google = new OpenAI({
-		apiKey: env.GEMINI_API_KEY,
-		baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
-		timeout: 999999999999,
-	});
-	return google;
+function getProviderApiKey(env: Env, provider: Exclude<Provider, "workers-ai">): string {
+	const key = provider === "openai" ? env.OPENAI_API_KEY
+		: provider === "google" ? env.GEMINI_API_KEY
+		: env.ANTHROPIC_API_KEY;
+	if (!key) {
+		const envVar = provider === "openai" ? "OPENAI_API_KEY" : provider === "google" ? "GEMINI_API_KEY" : "ANTHROPIC_API_KEY";
+		throw new Error(`${envVar} is not configured.`);
+	}
+	return key;
 }
 
 async function ensureModelSettingsTable(env: Env) {
@@ -266,48 +283,128 @@ async function setGroupModelSelection(env: Env, groupId: number, modelKey: strin
 	`).bind(groupId, modelKey, Date.now(), updatedBy ?? null).run();
 }
 
+// --- Image model registry (mirrors MODEL_REGISTRY / /model above) ---
+
+type ImageProvider = "google" | "workers-ai";
+type ImageModelConfig = {
+	provider: ImageProvider;
+	model: string;
+	label: string;
+};
+
+const IMAGE_MODEL_OFF = "off";
+const DEFAULT_IMAGE_MODEL_KEY = "nano-banana-2-lite";
+const IMAGE_MODEL_REGISTRY: Record<string, ImageModelConfig> = {
+	"nano-banana-2-lite": { provider: "google", model: "gemini-3.1-flash-lite-image", label: "Nano Banana 2 Lite" },
+	"nano-banana-2": { provider: "google", model: "gemini-3.1-flash-image", label: "Nano Banana 2" },
+	"flux-schnell": { provider: "workers-ai", model: "@cf/black-forest-labs/flux-1-schnell", label: "FLUX.1 [schnell]" },
+};
+
+type ImageModelSelection = { modelKey: string, modelConfig: ImageModelConfig | null };
+
+export function getImageModelByKey(modelKey: string): ImageModelSelection | null {
+	const normalized = normalizeModelKey(modelKey);
+	if (normalized === IMAGE_MODEL_OFF) {
+		return { modelKey: IMAGE_MODEL_OFF, modelConfig: null };
+	}
+	const modelConfig = IMAGE_MODEL_REGISTRY[normalized];
+	if (!modelConfig) {
+		const customMatch = normalized.match(/^(google|workers-ai):(.+)$/);
+		if (!customMatch) {
+			return null;
+		}
+		const provider = customMatch[1] as ImageProvider;
+		const rawModel = customMatch[2].trim();
+		if (!rawModel) {
+			return null;
+		}
+		return {
+			modelKey: `${provider}:${rawModel}`,
+			modelConfig: { provider, model: rawModel, label: `${provider.toUpperCase()} custom (${rawModel})` },
+		};
+	}
+	return { modelKey: normalized, modelConfig };
+}
+
+function listImageModelKeys() {
+	return Object.keys(IMAGE_MODEL_REGISTRY).sort();
+}
+
+function formatImageModelOptions() {
+	const grouped = { google: [] as string[], "workers-ai": [] as string[] };
+	for (const key of listImageModelKeys()) {
+		const modelConfig = IMAGE_MODEL_REGISTRY[key];
+		grouped[modelConfig.provider].push(`${key} (${modelConfig.label})`);
+	}
+	return [
+		"off (disable image generation)",
+		"",
+		"Google:",
+		...grouped.google,
+		"",
+		"Workers AI:",
+		...grouped["workers-ai"],
+	];
+}
+
+let imageModelSettingsTableReady = false;
+
+async function ensureImageModelSettingsTable(env: Env) {
+	if (imageModelSettingsTableReady) {
+		return;
+	}
+	await env.DB.prepare(`
+		CREATE TABLE IF NOT EXISTS GroupImageModelSettings (
+			groupId TEXT PRIMARY KEY,
+			modelKey TEXT NOT NULL,
+			updatedAt INTEGER NOT NULL,
+			updatedBy INTEGER
+		)
+	`).run();
+	imageModelSettingsTableReady = true;
+}
+
+async function getGroupImageModelSelection(env: Env, groupId: number): Promise<ImageModelSelection> {
+	await ensureImageModelSettingsTable(env);
+	const selection = await env.DB.prepare(`
+		SELECT modelKey
+		FROM GroupImageModelSettings
+		WHERE CAST(groupId AS INTEGER) = ?
+		LIMIT 1
+	`).bind(groupId).first<{ modelKey: string }>();
+
+	if (!selection?.modelKey) {
+		return getImageModelByKey(DEFAULT_IMAGE_MODEL_KEY)!;
+	}
+	const selected = getImageModelByKey(selection.modelKey);
+	if (!selected) {
+		return getImageModelByKey(DEFAULT_IMAGE_MODEL_KEY)!;
+	}
+	return selected;
+}
+
+async function setGroupImageModelSelection(env: Env, groupId: number, modelKey: string, updatedBy?: number) {
+	await ensureImageModelSettingsTable(env);
+	await env.DB.prepare(`
+		INSERT OR REPLACE INTO GroupImageModelSettings(groupId, modelKey, updatedAt, updatedBy)
+		VALUES (CAST(? AS INTEGER), ?, ?, ?)
+	`).bind(groupId, modelKey, Date.now(), updatedBy ?? null).run();
+}
+
 type DispatchContent = ReturnType<typeof dispatchContent>;
 type ChatMessage = {
 	role: "system" | "user" | "assistant";
 	content: string | DispatchContent[];
 };
 
-type AnthropicContentBlock =
-	| { type: "text"; text: string }
-	| {
-		type: "image";
-		source: {
-			type: "base64";
-			media_type: string;
-			data: string;
-		};
-	};
-
-function toAnthropicContent(content: string | DispatchContent[]): AnthropicContentBlock[] {
+// @cf/* chat models take plain-text message content; flatten multimodal blocks to text
+// (image parts are dropped — only vision-capable Workers AI models handle images, and
+// none of the current registry entries are vision models).
+function flattenToText(content: string | DispatchContent[]): string {
 	if (typeof content === "string") {
-		return [{ type: "text", text: content }];
+		return content;
 	}
-	const blocks: AnthropicContentBlock[] = [];
-	for (const block of content) {
-		if (block.type === "text") {
-			blocks.push({ type: "text", text: block.text });
-			continue;
-		}
-		const imageUrl = block.image_url.url;
-		const dataUrlMatch = imageUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
-		if (!dataUrlMatch) {
-			continue;
-		}
-		blocks.push({
-			type: "image",
-			source: {
-				type: "base64",
-				media_type: dataUrlMatch[1],
-				data: dataUrlMatch[2],
-			},
-		});
-	}
-	return blocks;
+	return content.filter((b): b is { type: "text", text: string } => b.type === "text").map((b) => b.text).join("\n");
 }
 
 async function createModelResponse(
@@ -316,61 +413,36 @@ async function createModelResponse(
 	messages: ChatMessage[],
 	maxTokens = 4096,
 ) {
-	if (selectedModel.modelConfig.provider === "openai" || selectedModel.modelConfig.provider === "google") {
-		if (selectedModel.modelConfig.provider === "google" && !env.GEMINI_API_KEY) {
-			throw new Error("GEMINI_API_KEY is not configured.");
-		}
-		const client = selectedModel.modelConfig.provider === "google" ? getGoogleGenModel(env) : getGenModel(env);
-		const response = await client.chat.completions.create({
-			model: selectedModel.modelConfig.model,
+	const { provider, model, noTemperature } = selectedModel.modelConfig;
+
+	if (provider === "workers-ai") {
+		const response: any = await env.AI.run(
+			model as any,
+			{
+				messages: messages.map((m) => ({ role: m.role, content: flattenToText(m.content) })),
+				max_tokens: maxTokens,
+				...(noTemperature ? {} : { temperature }),
+			} as any,
+			{ gateway: { id: env.AI_GATEWAY_ID } },
+		);
+		return response?.response || "";
+	}
+
+	if (!env.WORKER_AI_TOKEN) {
+		throw new Error("WORKER_AI_TOKEN is not configured.");
+	}
+	const apiKey = getProviderApiKey(env, provider);
+	const client = getGatewayClient(env);
+	const response = await client.chat.completions.create(
+		{
+			model: `${GATEWAY_PROVIDER_SLUG[provider]}/${model}`,
 			messages: messages as any,
 			max_completion_tokens: maxTokens,
-			...(selectedModel.modelConfig.noTemperature ? {} : { temperature }),
-		});
-		return response.choices[0].message.content || "";
-	}
-
-	if (!env.ANTHROPIC_API_KEY) {
-		throw new Error("ANTHROPIC_API_KEY is not configured.");
-	}
-
-	const systemContent = messages
-		.filter((m) => m.role === "system")
-		.map((m) => (typeof m.content === "string" ? m.content : ""))
-		.filter(Boolean)
-		.join("\n\n");
-	const conversation = messages
-		.filter((m) => m.role !== "system")
-		.map((m) => ({
-			role: m.role,
-			content: toAnthropicContent(m.content),
-		}));
-
-	const response = await fetch("https://api.anthropic.com/v1/messages", {
-		method: "POST",
-		headers: {
-			"x-api-key": env.ANTHROPIC_API_KEY,
-			"anthropic-version": "2023-06-01",
-			"content-type": "application/json",
+			...(noTemperature ? {} : { temperature }),
 		},
-		body: JSON.stringify({
-			model: selectedModel.modelConfig.model,
-			system: systemContent,
-			messages: conversation,
-			max_tokens: maxTokens,
-			temperature,
-		}),
-	});
-	if (!response.ok) {
-		throw new Error(`Anthropic request failed: ${response.status} ${await response.text()}`);
-	}
-	const data = await response.json<any>();
-	const text = (data?.content || [])
-		.filter((c: any) => c?.type === "text")
-		.map((c: any) => c?.text || "")
-		.join("\n")
-		.trim();
-	return text;
+		{ headers: { Authorization: `Bearer ${apiKey}` } },
+	);
+	return response.choices[0].message.content || "";
 }
 
 // Notify owner about non-whitelisted group (only once per deployment)
@@ -437,11 +509,15 @@ function getCommandVar(str: string, delim: string) {
 	return str.slice(str.indexOf(delim) + delim.length);
 }
 
+type ImageBytes = { bytes: Uint8Array; mime: string };
+
 /**
  * Send a message as Telegram rich content (Bot API 10.1 sendRichMessage).
  * The model's GitHub-Flavored Markdown is passed verbatim in rich_message.markdown
  * and parsed into rich blocks server-side — no MarkdownV2 escaping required.
- * Returns { ok } so callers can show a notice on failure (no fallback by design).
+ * To attach an image, embed a real HTTPS URL via standard markdown image syntax
+ * (`![...](url)`) in `markdown` before calling this — no file upload needed here.
+ * Returns { ok } so callers can show a notice / fall back on failure.
  */
 async function sendRichMessage(
 	env: Env,
@@ -467,6 +543,161 @@ async function sendRichMessage(
 		return { ok: false, description: data?.description };
 	}
 	return { ok: true };
+}
+
+/**
+ * Stream an ephemeral (~30s) draft preview via sendRichMessageDraft while a summary
+ * is being generated. Best-effort only: per Bot API docs chat_id here is scoped to
+ * "the target private chat", so this may simply no-op/fail in group chats — that's
+ * fine, it's just a "generating…" hint and must never block the real sendRichMessage.
+ */
+async function sendRichMessageDraft(
+	env: Env,
+	chatId: number | string,
+	draftId: number,
+	markdown: string,
+): Promise<void> {
+	try {
+		const res = await fetch(`https://api.telegram.org/bot${env.SECRET_TELEGRAM_API_TOKEN}/sendRichMessageDraft`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ chat_id: chatId, draft_id: draftId, rich_message: { markdown } }),
+		});
+		const data = await res.json<any>().catch(() => null);
+		if (!data?.ok) {
+			console.debug("sendRichMessageDraft skipped/failed", res.status, JSON.stringify(data?.description));
+		}
+	} catch (e) {
+		console.debug("sendRichMessageDraft errored", e);
+	}
+}
+
+/** Fallback for when sendRichMessage's image markup is rejected: plain sendPhoto by URL, no caption. */
+async function sendPhoto(
+	env: Env,
+	chatId: number | string,
+	photoUrl: string,
+	replyToMessageId?: number,
+): Promise<{ ok: boolean; description?: string }> {
+	const body: Record<string, unknown> = {
+		chat_id: chatId,
+		photo: photoUrl,
+	};
+	if (replyToMessageId !== undefined) {
+		body.reply_parameters = { message_id: replyToMessageId };
+	}
+	const res = await fetch(`https://api.telegram.org/bot${env.SECRET_TELEGRAM_API_TOKEN}/sendPhoto`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	const data = await res.json<any>().catch(() => null);
+	if (!data?.ok) {
+		console.error("sendPhoto failed", res.status, JSON.stringify(data?.description));
+		return { ok: false, description: data?.description };
+	}
+	return { ok: true };
+}
+
+const R2_KEY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/** Random 14-char alphanumeric string, used as an unguessable R2 object filename. */
+export function randomAlphanumeric(length = 14): string {
+	const bytes = new Uint8Array(length);
+	crypto.getRandomValues(bytes);
+	return Array.from(bytes, (b) => R2_KEY_ALPHABET[b % R2_KEY_ALPHABET.length]).join("");
+}
+
+const MIME_EXTENSIONS: Record<string, string> = {
+	"image/png": "png",
+	"image/jpeg": "jpg",
+	"image/webp": "webp",
+	"image/gif": "gif",
+};
+
+/**
+ * Upload a generated summary image to R2 and return its public (r2.dev) URL.
+ * Keyed by group so images are easy to find/purge per group; filename is a random
+ * 14-char string so URLs can't be guessed/enumerated. Returns null on any failure.
+ */
+async function uploadSummaryImageToR2(env: Env, groupId: number, image: ImageBytes): Promise<string | null> {
+	try {
+		const ext = MIME_EXTENSIONS[image.mime] || "png";
+		const key = `${groupId}/${randomAlphanumeric(14)}.${ext}`;
+		await env.SUMMARY_IMAGES.put(key, image.bytes, { httpMetadata: { contentType: image.mime } });
+		return `${env.R2_PUBLIC_URL}/${key}`;
+	} catch (e) {
+		console.error("uploadSummaryImageToR2 failed", e);
+		return null;
+	}
+}
+
+/** Pull the first inline image (base64 + mime type) out of a Gemini generateContent response. */
+export function extractInlineImage(data: any): { mimeType: string; data: string } | null {
+	const parts = data?.candidates?.[0]?.content?.parts || [];
+	const imagePart = parts.find((p: any) => p?.inlineData?.data);
+	return imagePart ? imagePart.inlineData : null;
+}
+
+/**
+ * Generate an illustration for a /summary via the group's chosen image model.
+ * Never throws — returns null (and logs) on any failure so an image outage
+ * can't block the summary itself from being sent.
+ */
+async function generateSummaryImage(
+	env: Env,
+	imageSelection: { modelKey: string, modelConfig: ImageModelConfig },
+	summaryText: string,
+): Promise<ImageBytes | null> {
+	const prompt = `create an image for the following summary\n\n${summaryText}`;
+	try {
+		if (imageSelection.modelConfig.provider === "google") {
+			if (!env.GEMINI_API_KEY) {
+				throw new Error("GEMINI_API_KEY is not configured.");
+			}
+			const res = await fetch(
+				`https://gateway.ai.cloudflare.com/v1/${env.CF_ACCOUNT_ID}/${env.AI_GATEWAY_ID}/google-ai-studio/v1beta/models/${imageSelection.modelConfig.model}:generateContent`,
+				{
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						"cf-aig-authorization": `Bearer ${env.WORKER_AI_TOKEN}`,
+						"x-goog-api-key": env.GEMINI_API_KEY,
+					},
+					body: JSON.stringify({
+						contents: [{ role: "user", parts: [{ text: prompt }] }],
+						generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+					}),
+				},
+			);
+			if (!res.ok) {
+				throw new Error(`Image generation failed: ${res.status} ${await res.text()}`);
+			}
+			const data = await res.json<any>();
+			const inlineImage = extractInlineImage(data);
+			if (!inlineImage) {
+				throw new Error("No inline image data in generateContent response");
+			}
+			return {
+				bytes: Uint8Array.from(Buffer.from(inlineImage.data, "base64")),
+				mime: inlineImage.mimeType || "image/png",
+			};
+		}
+
+		// workers-ai
+		const response: any = await env.AI.run(
+			imageSelection.modelConfig.model as any,
+			{ prompt } as any,
+			{ gateway: { id: env.AI_GATEWAY_ID } },
+		);
+		if (!response?.image) {
+			throw new Error("No image data in Workers AI response");
+		}
+		return { bytes: Uint8Array.from(Buffer.from(response.image, "base64")), mime: "image/jpeg" };
+	} catch (e) {
+		console.error("generateSummaryImage failed", e);
+		return null;
+	}
 }
 
 /**
@@ -760,6 +991,13 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 							summaryHeader = `Chat summary of the last ${results.length} messages\nTime frame: ${firstMessageTime} to ${lastMessageTime}`;
 						}
 
+						await sendRichMessageDraft(
+							env,
+							groupId,
+							bot.update.message!.message_id,
+							`Summarizing ${results.length} message${results.length === 1 ? '' : 's'}. Standby...`,
+						);
+
 						const rawSummary = await createModelResponse(
 							env,
 							selectedModel,
@@ -787,10 +1025,36 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 						);
 
 						// Pass the model's GitHub-Flavored Markdown verbatim to Telegram as a rich message.
-						const summaryMarkdown = `**Summary by ${selectedModel.modelKey}**\n\n${fixLink(rawSummary)}`;
+						const plainSummaryMarkdown = `**Summary by ${selectedModel.modelKey}**\n\n${fixLink(rawSummary)}`;
+
+						const imageSelection = await getGroupImageModelSelection(env, groupId);
+						const imageModelConfig = imageSelection.modelConfig;
+						const imageBytes = imageModelConfig
+							? await generateSummaryImage(env, { modelKey: imageSelection.modelKey, modelConfig: imageModelConfig }, plainSummaryMarkdown)
+							: null;
+						// Uploaded to our own R2 bucket (group-scoped, unguessable filename) so it can be
+						// embedded as a plain HTTPS URL — attach://-style multipart uploads to sendRichMessage
+						// are not actually supported by the Bot API.
+						const imageUrl = imageBytes ? await uploadSummaryImageToR2(env, groupId, imageBytes) : null;
+
+						const summaryMarkdown = imageUrl
+							? `**Summary by ${selectedModel.modelKey} · image by ${imageSelection.modelKey}**\n\n${fixLink(rawSummary)}\n\n![Summary illustration](${imageUrl})`
+							: plainSummaryMarkdown;
+
 						const sent = await sendRichMessage(env, groupId, summaryMarkdown, bot.update.message!.message_id);
+
 						if (!sent.ok) {
-							await bot.reply(`⚠️ Unable to generate enhanced markdown.`);
+							if (imageUrl) {
+								// Image markup rejected by the rich-message API — fall back to a
+								// plain photo reply followed by the text-only rich summary.
+								await sendPhoto(env, groupId, imageUrl, bot.update.message!.message_id);
+								const textOnlySent = await sendRichMessage(env, groupId, plainSummaryMarkdown, bot.update.message!.message_id);
+								if (!textOnlySent.ok) {
+									await bot.reply(`⚠️ Unable to generate enhanced markdown.`);
+								}
+							} else {
+								await bot.reply(`⚠️ Unable to generate enhanced markdown.`);
+							}
 						}
 					}
 					catch (e) {
@@ -825,7 +1089,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 
 				if (!arg || arg.toLowerCase() === "list") {
 					await ctx.reply(
-						`Current model: ${current.modelKey}\nAvailable models:\n${formatModelOptions().join("\n")}\n\nUse /model <model-key> to switch.\nCustom format: /model openai:<model> or /model google:<model> or /model anthropic:<model>`
+						`Current model: ${current.modelKey}\nAvailable models:\n${formatModelOptions().join("\n")}\n\nUse /model <model-key> to switch.\nCustom format: /model openai:<model> or /model google:<model> or /model anthropic:<model> or /model workers-ai:<model>`
 					);
 					return new Response('ok');
 				}
@@ -833,8 +1097,12 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 				const requested = getModelByKey(arg);
 				if (!requested) {
 					await ctx.reply(
-						`Unknown model: ${arg}\nAvailable models:\n${formatModelOptions().join("\n")}\n\nCustom format: /model openai:<model> or /model google:<model> or /model anthropic:<model>`
+						`Unknown model: ${arg}\nAvailable models:\n${formatModelOptions().join("\n")}\n\nCustom format: /model openai:<model> or /model google:<model> or /model anthropic:<model> or /model workers-ai:<model>`
 					);
+					return new Response('ok');
+				}
+				if (requested.modelConfig.provider !== "workers-ai" && !env.WORKER_AI_TOKEN) {
+					await ctx.reply("WORKER_AI_TOKEN is not configured. Add it before selecting gateway-routed models.");
 					return new Response('ok');
 				}
 				if (requested.modelConfig.provider === "anthropic" && !env.ANTHROPIC_API_KEY) {
@@ -848,6 +1116,55 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 
 				await setGroupModelSelection(env, groupId, requested.modelKey, ctx.update.message?.from?.id);
 				await ctx.reply(`Model updated to ${requested.modelKey} (${requested.modelConfig.label}).`);
+				return new Response('ok');
+			})
+			.on("imagemodel", async (ctx) => {
+				const chat = ctx.update.message?.chat;
+				if (!chat || !chat.type.includes('group')) {
+					await ctx.reply('Please use /imagemodel in a group chat.');
+					return new Response('ok');
+				}
+				const groupId = chat.id;
+				const { results: whitelistResults } = await env.DB.prepare(`
+					SELECT groupId FROM WhitelistedGroups WHERE CAST(groupId AS INTEGER) = ?
+				`).bind(groupId).all();
+
+				if (!whitelistResults || whitelistResults.length === 0) {
+					await ctx.reply(`This group (ID: ${groupId}) is not whitelisted. Please contact the bot owner.`);
+					const groupName = chat.title || 'Unknown';
+					await notifyOwnerAboutGroup(ctx.api, env, groupId, groupName);
+					return new Response('ok');
+				}
+
+				const messageText = (ctx.update.message?.text || "").trim();
+				const arg = messageText.split(/\s+/)[1]?.trim();
+				const current = await getGroupImageModelSelection(env, groupId);
+
+				if (!arg || arg.toLowerCase() === "list") {
+					await ctx.reply(
+						`Current image model: ${current.modelKey}\nAvailable image models:\n${formatImageModelOptions().join("\n")}\n\nUse /imagemodel <model-key> to switch, or /imagemodel off to disable.\nCustom format: /imagemodel google:<model> or /imagemodel workers-ai:<model>`
+					);
+					return new Response('ok');
+				}
+
+				const requested = getImageModelByKey(arg);
+				if (!requested) {
+					await ctx.reply(
+						`Unknown image model: ${arg}\nAvailable image models:\n${formatImageModelOptions().join("\n")}\n\nCustom format: /imagemodel google:<model> or /imagemodel workers-ai:<model>`
+					);
+					return new Response('ok');
+				}
+				if (requested.modelConfig?.provider === "google" && !env.GEMINI_API_KEY) {
+					await ctx.reply("GEMINI_API_KEY is not configured. Add it before selecting Gemini image models.");
+					return new Response('ok');
+				}
+
+				await setGroupImageModelSelection(env, groupId, requested.modelKey, ctx.update.message?.from?.id);
+				await ctx.reply(
+					requested.modelKey === IMAGE_MODEL_OFF
+						? "Image generation disabled for /summary in this group."
+						: `Image model updated to ${requested.modelKey} (${requested.modelConfig!.label}).`
+				);
 				return new Response('ok');
 			})
 			.on('my_chat_member', async (ctx) => {
