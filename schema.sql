@@ -29,3 +29,10 @@ CREATE TABLE IF NOT EXISTS GroupImageModelSettings (
 	updatedAt INTEGER NOT NULL,
 	updatedBy INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS BotSettings (
+	key TEXT PRIMARY KEY,
+	value TEXT,
+	updatedAt INTEGER NOT NULL,
+	updatedBy INTEGER
+);

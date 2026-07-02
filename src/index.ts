@@ -154,9 +154,10 @@ const MODEL_REGISTRY: Record<string, ModelConfig> = {
 	"claude-3.5-haiku": { provider: "anthropic", model: "claude-3-5-haiku-latest", label: "Claude 3.5 Haiku" },
 };
 
-const temperature = 0.4;
+const DEFAULT_TEMPERATURE = 0.4;
 
 let modelSettingsTableReady = false;
+let botSettingsTableReady = false;
 
 function normalizeModelKey(input: string) {
 	return input.trim().toLowerCase();
@@ -391,6 +392,54 @@ async function setGroupImageModelSelection(env: Env, groupId: number, modelKey: 
 	`).bind(groupId, modelKey, Date.now(), updatedBy ?? null).run();
 }
 
+// Global key/value bot settings shared across every group (e.g. persona, temperature).
+async function ensureBotSettingsTable(env: Env) {
+	if (botSettingsTableReady) {
+		return;
+	}
+	await env.DB.prepare(`
+		CREATE TABLE IF NOT EXISTS BotSettings (
+			key TEXT PRIMARY KEY,
+			value TEXT,
+			updatedAt INTEGER NOT NULL,
+			updatedBy INTEGER
+		)
+	`).run();
+	botSettingsTableReady = true;
+}
+
+async function getBotSetting(env: Env, key: string) {
+	await ensureBotSettingsTable(env);
+	const row = await env.DB.prepare(`
+		SELECT value FROM BotSettings WHERE key = ? LIMIT 1
+	`).bind(key).first<{ value: string }>();
+	return row?.value ?? null;
+}
+
+async function setBotSetting(env: Env, key: string, value: string, updatedBy?: number) {
+	await ensureBotSettingsTable(env);
+	await env.DB.prepare(`
+		INSERT OR REPLACE INTO BotSettings(key, value, updatedAt, updatedBy)
+		VALUES (?, ?, ?, ?)
+	`).bind(key, value, Date.now(), updatedBy ?? null).run();
+}
+
+async function deleteBotSetting(env: Env, key: string) {
+	await ensureBotSettingsTable(env);
+	await env.DB.prepare(`DELETE FROM BotSettings WHERE key = ?`).bind(key).run();
+}
+
+// Resolve the personality override (universal across all groups) and temperature.
+async function getBotPersona(env: Env) {
+	return await getBotSetting(env, "persona");
+}
+
+async function getBotTemperature(env: Env) {
+	const raw = await getBotSetting(env, "temperature");
+	const parsed = raw == null ? NaN : parseFloat(raw);
+	return Number.isFinite(parsed) ? parsed : DEFAULT_TEMPERATURE;
+}
+
 type DispatchContent = ReturnType<typeof dispatchContent>;
 type ChatMessage = {
 	role: "system" | "user" | "assistant";
@@ -412,6 +461,7 @@ async function createModelResponse(
 	selectedModel: { modelKey: string, modelConfig: ModelConfig },
 	messages: ChatMessage[],
 	maxTokens = 4096,
+	temperature = DEFAULT_TEMPERATURE,
 ) {
 	const { provider, model, noTemperature } = selectedModel.modelConfig;
 
@@ -463,9 +513,13 @@ async function notifyOwnerAboutGroup(bot: TelegramApi, env: Env, groupId: number
 	}
 }
 
-// System prompts for different scenarios
-const SYSTEM_PROMPTS = {
-  summarizeChat: `You are a professional group chat summarization assistant. Your task is to summarize conversations in a natural, group-chat-friendly tone, in English only.
+// Default personality/persona lines. The bot admin can override these on the fly
+// with /persona; a single override applies universally to both summarize and ask.
+const DEFAULT_PERSONA_SUMMARIZE = `You are a professional group chat summarization assistant. Your task is to summarize conversations in a natural, group-chat-friendly tone, in English only.`;
+const DEFAULT_PERSONA_ANSWER = `You are an intelligent group chat assistant. Your task is to answer user questions based on the provided chat history, in English only.`;
+
+// The non-personality guidance for each scenario. These stay fixed regardless of persona.
+const PROMPT_BODY_SUMMARIZE = `
 
 The conversation will be provided in the following format:
 ====================
@@ -484,9 +538,9 @@ Follow these guidelines:
 7. For each topic add a brief bullet paragraph offset note labeled "AI context:" — 1-2 factual, useful pieces of information relevant to the topic (background facts, current data, clarifications, or counterpoints from general knowledge). Do NOT comment on the tone, humor, or sentiment of the conversation.
 8. Keep the total response within ~256 words and be as concise as possible.
 
-Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — text color, headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links, and markdown color. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`,
+Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — text color, headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links, and markdown color. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`;
 
-  answerQuestion: `You are an intelligent group chat assistant. Your task is to answer user questions based on the provided chat history, in English only.
+const PROMPT_BODY_ANSWER = `
 
 The chat history will be provided in the following format:
 ====================
@@ -502,8 +556,18 @@ Follow these guidelines:
 4. Output must be entirely in English, but it is fine to quote non-English content from the chat as long as the answer itself is in English.
 5. Keep the answer concise (within ~256 words) unless the question genuinely requires more detail.
 
-Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — text color, headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`
-};
+Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — text color, headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`;
+
+// Build the system prompts, applying the admin persona override (if any) to both
+// scenarios. When no override is set, each scenario keeps its own default persona.
+function buildSystemPrompts(personaOverride: string | null) {
+	const summarizePersona = personaOverride || DEFAULT_PERSONA_SUMMARIZE;
+	const answerPersona = personaOverride || DEFAULT_PERSONA_ANSWER;
+	return {
+		summarizeChat: `${summarizePersona}${PROMPT_BODY_SUMMARIZE}`,
+		answerQuestion: `${answerPersona}${PROMPT_BODY_ANSWER}`,
+	};
+}
 
 function getCommandVar(str: string, delim: string) {
 	return str.slice(str.indexOf(delim) + delim.length);
@@ -879,13 +943,16 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 				}
 				let answerText = "";
 				try {
+					const persona = await getBotPersona(env);
+					const systemPrompts = buildSystemPrompts(persona);
+					const botTemperature = await getBotTemperature(env);
 					answerText = await createModelResponse(
 						env,
 						selectedModel,
 						[
 							{
 								role: "system",
-								content: SYSTEM_PROMPTS.answerQuestion,
+								content: systemPrompts.answerQuestion,
 							},
 							{
 								role: "user",
@@ -899,6 +966,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 							},
 						],
 						4096,
+						botTemperature,
 					);
 				} catch (e) {
 					console.error(e);
@@ -978,6 +1046,9 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 				if (results.length > 0) {
 					try {
 						const selectedModel = await getGroupModelSelection(env, groupId);
+						const persona = await getBotPersona(env);
+						const systemPrompts = buildSystemPrompts(persona);
+						const botTemperature = await getBotTemperature(env);
 						// Calculate actual time frame from messages
 						const firstMessageTime = getSendTime(results[0] as R);
 						const lastMessageTime = getSendTime(results[results.length - 1] as R);
@@ -1004,7 +1075,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 							[
 								{
 									role: "system",
-									content: SYSTEM_PROMPTS.summarizeChat,
+									content: systemPrompts.summarizeChat,
 								},
 								{
 									role: "user",
@@ -1022,6 +1093,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 								},
 							],
 							4096,
+							botTemperature,
 						);
 
 						// Pass the model's GitHub-Flavored Markdown verbatim to Telegram as a rich message.
@@ -1165,6 +1237,87 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 						? "Image generation disabled for /summary in this group."
 						: `Image model updated to ${requested.modelKey} (${requested.modelConfig!.label}).`
 				);
+				return new Response('ok');
+			})
+			.on("persona", async (ctx) => {
+				// Admin-only command, usable in a direct (private) chat with the bot.
+				// Sets a universal personality prompt and/or model temperature for
+				// every group's /summary and /ask.
+				const ownerUserId = parseInt(env.OWNER_ID);
+				const userId = ctx.update.message?.from?.id;
+				const chat = ctx.update.message?.chat;
+
+				if (userId !== ownerUserId) {
+					await ctx.reply('You are not authorized to use this command.');
+					return new Response('ok');
+				}
+				if (chat?.type !== 'private') {
+					await ctx.reply('Please use /persona in a direct chat with the bot.');
+					return new Response('ok');
+				}
+
+				const text = (ctx.update.message?.text || "").trim();
+				const firstSpace = text.indexOf(" ");
+				const rest = firstSpace === -1 ? "" : text.slice(firstSpace + 1).trim();
+
+				const showCurrent = async () => {
+					const persona = await getBotPersona(env);
+					const temp = await getBotTemperature(env);
+					await ctx.reply(
+						`Current personality prompt:
+${persona ?? `(default) ${DEFAULT_PERSONA_SUMMARIZE}`}
+
+` +
+						`Temperature: ${temp}
+
+` +
+						`Usage:
+` +
+						`/persona <text> — set the personality prompt (applies to /summary and /ask in all groups)
+` +
+						`/persona temp <0-2> — set the model temperature
+` +
+						`/persona reset — restore the default persona and temperature`
+					);
+				};
+
+				if (!rest) {
+					await showCurrent();
+					return new Response('ok');
+				}
+
+				const subSpace = rest.indexOf(" ");
+				const sub = (subSpace === -1 ? rest : rest.slice(0, subSpace)).toLowerCase();
+				const subArg = subSpace === -1 ? "" : rest.slice(subSpace + 1).trim();
+
+				if (sub === "reset") {
+					await deleteBotSetting(env, "persona");
+					await deleteBotSetting(env, "temperature");
+					await ctx.reply(`Persona and temperature reset to defaults (temperature ${DEFAULT_TEMPERATURE}).`);
+					return new Response('ok');
+				}
+
+				if (sub === "temp" || sub === "temperature") {
+					const value = parseFloat(subArg);
+					if (!Number.isFinite(value) || value < 0 || value > 2) {
+						await ctx.reply('Please provide a temperature between 0 and 2, e.g. /persona temp 0.7');
+						return new Response('ok');
+					}
+					await setBotSetting(env, "temperature", String(value), userId);
+					await ctx.reply(`Temperature updated to ${value}.`);
+					return new Response('ok');
+				}
+
+				// Otherwise treat the whole argument as the new persona text.
+				const persona = sub === "set" ? subArg : rest;
+				if (!persona) {
+					await ctx.reply('Please provide the personality text, e.g. /persona You are a witty pirate assistant.');
+					return new Response('ok');
+				}
+				await setBotSetting(env, "persona", persona, userId);
+				await ctx.reply(`Personality prompt updated. It now applies to /summary and /ask in all groups.
+
+${persona}`);
 				return new Response('ok');
 			})
 			.on('my_chat_member', async (ctx) => {
