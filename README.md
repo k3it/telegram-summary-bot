@@ -71,6 +71,18 @@ switch image model for this group (persisted in D1)
 
 disable image generation for `/summary` in this group
 
+/schedule 21:00
+
+send a daily summary of the last 24h to this group at 21:00 US/Eastern (top-of-the-hour only; skipped when the group had fewer than 10 messages)
+
+/schedule off
+
+disable the daily summary for this group
+
+/schedule list
+
+(owner, in a private chat with the bot) list all whitelisted groups with their IDs and schedules; then `/schedule <groupId> <HH:00|off>` to manage a group remotely
+
 ## Cost
 
 **0**

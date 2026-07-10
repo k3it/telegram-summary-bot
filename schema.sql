@@ -30,6 +30,13 @@ CREATE TABLE IF NOT EXISTS GroupImageModelSettings (
 	updatedBy INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS GroupScheduleSettings (
+	groupId TEXT PRIMARY KEY,
+	hourEt INTEGER NOT NULL,
+	updatedAt INTEGER NOT NULL,
+	updatedBy INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS BotSettings (
 	key TEXT PRIMARY KEY,
 	value TEXT,

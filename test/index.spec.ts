@@ -8,6 +8,7 @@ import {
 	GATEWAY_PROVIDER_SLUG,
 	extractInlineImage,
 	randomAlphanumeric,
+	parseScheduleHour,
 } from "./../src/index"
 
 describe("test fix link", () => {
@@ -114,6 +115,31 @@ describe("extractInlineImage", () => {
 	it("returns null for malformed/empty responses", () => {
 		expect(extractInlineImage({})).toBeNull();
 		expect(extractInlineImage(null)).toBeNull();
+	});
+});
+
+describe("parseScheduleHour", () => {
+	it("accepts bare hours and HH:00 forms", () => {
+		expect(parseScheduleHour("21")).toBe(21);
+		expect(parseScheduleHour("21:00")).toBe(21);
+		expect(parseScheduleHour("9:00")).toBe(9);
+		expect(parseScheduleHour("09:00")).toBe(9);
+		expect(parseScheduleHour("0")).toBe(0);
+		expect(parseScheduleHour("23:00")).toBe(23);
+	});
+
+	it("rejects non-top-of-hour minutes (cron fires hourly)", () => {
+		expect(parseScheduleHour("21:30")).toBeNull();
+		expect(parseScheduleHour("9:15")).toBeNull();
+	});
+
+	it("rejects out-of-range and malformed input", () => {
+		expect(parseScheduleHour("24")).toBeNull();
+		expect(parseScheduleHour("25:00")).toBeNull();
+		expect(parseScheduleHour("-1")).toBeNull();
+		expect(parseScheduleHour("off")).toBeNull();
+		expect(parseScheduleHour("21:0")).toBeNull();
+		expect(parseScheduleHour("")).toBeNull();
 	});
 });
 

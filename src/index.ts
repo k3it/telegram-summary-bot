@@ -429,6 +429,74 @@ async function deleteBotSetting(env: Env, key: string) {
 	await env.DB.prepare(`DELETE FROM BotSettings WHERE key = ?`).bind(key).run();
 }
 
+// --- Daily scheduled summaries (per-group send hour, US/Eastern) ---
+
+// Skip a scheduled summary when the group had fewer messages than this in the
+// last 24h — the old auto-summary feature was removed for sending empty summaries.
+const MIN_SCHEDULED_SUMMARY_MESSAGES = 10;
+
+let scheduleSettingsTableReady = false;
+
+async function ensureScheduleSettingsTable(env: Env) {
+	if (scheduleSettingsTableReady) {
+		return;
+	}
+	await env.DB.prepare(`
+		CREATE TABLE IF NOT EXISTS GroupScheduleSettings (
+			groupId TEXT PRIMARY KEY,
+			hourEt INTEGER NOT NULL,
+			updatedAt INTEGER NOT NULL,
+			updatedBy INTEGER
+		)
+	`).run();
+	scheduleSettingsTableReady = true;
+}
+
+async function getGroupScheduleHour(env: Env, groupId: number): Promise<number | null> {
+	await ensureScheduleSettingsTable(env);
+	const row = await env.DB.prepare(`
+		SELECT hourEt FROM GroupScheduleSettings WHERE CAST(groupId AS INTEGER) = ? LIMIT 1
+	`).bind(groupId).first<{ hourEt: number }>();
+	return row?.hourEt ?? null;
+}
+
+async function setGroupScheduleHour(env: Env, groupId: number, hourEt: number, updatedBy?: number) {
+	await ensureScheduleSettingsTable(env);
+	await env.DB.prepare(`
+		INSERT OR REPLACE INTO GroupScheduleSettings(groupId, hourEt, updatedAt, updatedBy)
+		VALUES (CAST(? AS INTEGER), ?, ?, ?)
+	`).bind(groupId, hourEt, Date.now(), updatedBy ?? null).run();
+}
+
+async function deleteGroupSchedule(env: Env, groupId: number) {
+	await ensureScheduleSettingsTable(env);
+	await env.DB.prepare(`
+		DELETE FROM GroupScheduleSettings WHERE CAST(groupId AS INTEGER) = ?
+	`).bind(groupId).run();
+}
+
+/**
+ * Parse a schedule time argument ("21", "21:00", "9:00") into an hour 0-23.
+ * The cron fires hourly, so only top-of-the-hour times are accepted;
+ * returns null for anything else.
+ */
+export function parseScheduleHour(input: string): number | null {
+	const m = input.trim().match(/^(\d{1,2})(?::(\d{2}))?$/);
+	if (!m) {
+		return null;
+	}
+	const hour = parseInt(m[1]);
+	const minute = m[2] ? parseInt(m[2]) : 0;
+	if (hour > 23 || minute !== 0) {
+		return null;
+	}
+	return hour;
+}
+
+function formatScheduleHour(hourEt: number) {
+	return `${hourEt.toString().padStart(2, "0")}:00 US/Eastern`;
+}
+
 // Resolve the personality override (universal across all groups) and temperature.
 async function getBotPersona(env: Env) {
 	return await getBotSetting(env, "persona");
@@ -707,6 +775,8 @@ export function extractInlineImage(data: any): { mimeType: string; data: string 
  * Generate an illustration for a /summary via the group's chosen image model.
  * Never throws — returns null (and logs) on any failure so an image outage
  * can't block the summary itself from being sent.
+ * If the persona-flavored prompt fails (e.g. the provider's content-safety
+ * filter rejects it), a second attempt is made without the persona text.
  */
 async function generateSummaryImage(
 	env: Env,
@@ -714,10 +784,10 @@ async function generateSummaryImage(
 	summaryText: string,
 	persona: string | null = null,
 ): Promise<ImageBytes | null> {
-	const prompt = persona
-		? `${persona}\n\ncreate an image for the following summary\n\n${summaryText}`
-		: `create an image for the following summary\n\n${summaryText}`;
-	try {
+	const attempt = async (personaText: string | null): Promise<ImageBytes> => {
+		const prompt = personaText
+			? `${personaText}\n\ncreate an image for the following summary\n\n${summaryText}`
+			: `create an image for the following summary\n\n${summaryText}`;
 		if (imageSelection.modelConfig.provider === "google") {
 			if (!env.GEMINI_API_KEY) {
 				throw new Error("GEMINI_API_KEY is not configured.");
@@ -743,7 +813,10 @@ async function generateSummaryImage(
 			const data = await res.json<any>();
 			const inlineImage = extractInlineImage(data);
 			if (!inlineImage) {
-				throw new Error("No inline image data in generateContent response");
+				// Safety blocks come back as 200 with no image part; surface the reason for the log.
+				const finishReason = data?.candidates?.[0]?.finishReason;
+				const blockReason = data?.promptFeedback?.blockReason;
+				throw new Error(`No inline image data in generateContent response (finishReason: ${finishReason ?? "n/a"}, blockReason: ${blockReason ?? "n/a"})`);
 			}
 			return {
 				bytes: Uint8Array.from(Buffer.from(inlineImage.data, "base64")),
@@ -761,17 +834,107 @@ async function generateSummaryImage(
 			throw new Error("No image data in Workers AI response");
 		}
 		return { bytes: Uint8Array.from(Buffer.from(response.image, "base64")), mime: "image/jpeg" };
+	};
+
+	try {
+		return await attempt(persona);
 	} catch (e) {
-		console.error("generateSummaryImage failed", e);
-		return null;
+		if (!persona) {
+			console.error("generateSummaryImage failed", e);
+			return null;
+		}
+		console.error("generateSummaryImage failed with persona, retrying without persona", e);
+		try {
+			return await attempt(null);
+		} catch (e2) {
+			console.error("generateSummaryImage retry without persona failed", e2);
+			return null;
+		}
 	}
 }
 
 /**
- * 
- * @param text 
+ * Full summary pipeline shared by the /summary command and the daily scheduled
+ * summaries: model call with the group's model/persona/temperature, optional AI
+ * illustration (uploaded to R2), and rich-message delivery with photo fallback.
+ * Throws if the model call fails; returns { ok: false } if delivery failed.
+ */
+async function generateAndSendSummary(
+	env: Env,
+	groupId: number,
+	results: Record<string, unknown>[],
+	summaryHeader: string,
+	replyToMessageId?: number,
+): Promise<{ ok: boolean }> {
+	const selectedModel = await getGroupModelSelection(env, groupId);
+	const persona = await getBotPersona(env);
+	const systemPrompts = buildSystemPrompts(persona);
+	const botTemperature = await getBotTemperature(env);
+
+	const rawSummary = await createModelResponse(
+		env,
+		selectedModel,
+		[
+			{
+				role: "system",
+				content: systemPrompts.summarizeChat,
+			},
+			{
+				role: "user",
+				content: [
+					dispatchContent(`Please summarize this chat history.\n${summaryHeader}`),
+					...results.flatMap(
+						(r: any) => [
+							dispatchContent(`====================`),
+							dispatchContent(`${r.userName}:`),
+							dispatchContent(r.content),
+							dispatchContent(getMessageLink(r)),
+						]
+					),
+				],
+			},
+		],
+		4096,
+		botTemperature,
+	);
+
+	// Pass the model's GitHub-Flavored Markdown verbatim to Telegram as a rich message.
+	const plainSummaryMarkdown = `**Summary by ${selectedModel.modelKey}**\n\n${fixLink(rawSummary)}`;
+
+	const imageSelection = await getGroupImageModelSelection(env, groupId);
+	const imageModelConfig = imageSelection.modelConfig;
+	const imageBytes = imageModelConfig
+		? await generateSummaryImage(env, { modelKey: imageSelection.modelKey, modelConfig: imageModelConfig }, plainSummaryMarkdown, persona)
+		: null;
+	// Uploaded to our own R2 bucket (group-scoped, unguessable filename) so it can be
+	// embedded as a plain HTTPS URL — attach://-style multipart uploads to sendRichMessage
+	// are not actually supported by the Bot API.
+	const imageUrl = imageBytes ? await uploadSummaryImageToR2(env, groupId, imageBytes) : null;
+
+	const summaryMarkdown = imageUrl
+		? `**Summary by ${selectedModel.modelKey} · image by ${imageSelection.modelKey}**\n\n${fixLink(rawSummary)}\n\n![Summary illustration](${imageUrl})`
+		: plainSummaryMarkdown;
+
+	const sent = await sendRichMessage(env, groupId, summaryMarkdown, replyToMessageId);
+
+	if (!sent.ok) {
+		if (imageUrl) {
+			// Image markup rejected by the rich-message API — fall back to a
+			// plain photo reply followed by the text-only rich summary.
+			await sendPhoto(env, groupId, imageUrl, replyToMessageId);
+			const textOnlySent = await sendRichMessage(env, groupId, plainSummaryMarkdown, replyToMessageId);
+			return { ok: textOnlySent.ok };
+		}
+		return { ok: false };
+	}
+	return { ok: true };
+}
+
+/**
+ *
+ * @param text
  * @description I dont know why, but llm keep output tme.cat, so we need to fix it
- * @returns 
+ * @returns
  */
 function fixLink(text: string) {
 	return text.replace(/tme\.cat/g, "t.me/c").replace(/\/c\/c/g, "/c");
@@ -791,6 +954,41 @@ export default {
 	) {
 		console.debug("Scheduled task starting:", new Date().toISOString());
 		const date = new Date(new Date().toLocaleString("en-US", { timeZone: "US/Eastern" }));
+
+		// Send daily summaries to groups scheduled for the current hour (US/Eastern).
+		// Only whitelisted groups qualify, and quiet groups are skipped so we never
+		// send an empty summary.
+		await ensureScheduleSettingsTable(env);
+		const { results: dueGroups } = await env.DB.prepare(`
+			SELECT s.groupId
+			FROM GroupScheduleSettings s
+			JOIN WhitelistedGroups w ON CAST(w.groupId AS INTEGER) = CAST(s.groupId AS INTEGER)
+			WHERE s.hourEt = ?
+		`).bind(date.getHours()).all<{ groupId: string }>();
+		for (const dueGroup of dueGroups ?? []) {
+			const groupId = parseInt(dueGroup.groupId);
+			try {
+				const { results } = await env.DB.prepare(`
+					SELECT * FROM Messages
+					WHERE groupId=? AND timeStamp >= ?
+					ORDER BY timeStamp ASC
+					`)
+					.bind(groupId, Date.now() - 24 * 60 * 60 * 1000)
+					.all();
+				if (!results || results.length < MIN_SCHEDULED_SUMMARY_MESSAGES) {
+					console.debug(`Skipping scheduled summary for group ${groupId}: only ${results?.length ?? 0} messages in the last 24h`);
+					continue;
+				}
+				const firstMessageTime = getSendTime(results[0] as R);
+				const lastMessageTime = getSendTime(results[results.length - 1] as R);
+				const summaryHeader = `Daily chat summary for the last 24 hours\nTime frame: ${firstMessageTime} to ${lastMessageTime}\nMessage count: ${results.length}`;
+				await generateAndSendSummary(env, groupId, results, summaryHeader);
+				console.debug(`Scheduled summary sent to group ${groupId}`);
+			} catch (e) {
+				console.error(`Scheduled summary failed for group ${groupId}`, e);
+			}
+		}
+
 		// Clean up oldest 4000 messages
 		if (date.getHours() === 0 && date.getMinutes() < 5) {
 			await env.DB.prepare(`
@@ -1048,10 +1246,6 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 				}
 				if (results.length > 0) {
 					try {
-						const selectedModel = await getGroupModelSelection(env, groupId);
-						const persona = await getBotPersona(env);
-						const systemPrompts = buildSystemPrompts(persona);
-						const botTemperature = await getBotTemperature(env);
 						// Calculate actual time frame from messages
 						const firstMessageTime = getSendTime(results[0] as R);
 						const lastMessageTime = getSendTime(results[results.length - 1] as R);
@@ -1072,64 +1266,9 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 							`Summarizing ${results.length} message${results.length === 1 ? '' : 's'}. Standby...`,
 						);
 
-						const rawSummary = await createModelResponse(
-							env,
-							selectedModel,
-							[
-								{
-									role: "system",
-									content: systemPrompts.summarizeChat,
-								},
-								{
-									role: "user",
-									content: [
-										dispatchContent(`Please summarize this chat history.\n${summaryHeader}`),
-										...results.flatMap(
-											(r: any) => [
-												dispatchContent(`====================`),
-												dispatchContent(`${r.userName}:`),
-												dispatchContent(r.content),
-												dispatchContent(getMessageLink(r)),
-											]
-										),
-									],
-								},
-							],
-							4096,
-							botTemperature,
-						);
-
-						// Pass the model's GitHub-Flavored Markdown verbatim to Telegram as a rich message.
-						const plainSummaryMarkdown = `**Summary by ${selectedModel.modelKey}**\n\n${fixLink(rawSummary)}`;
-
-						const imageSelection = await getGroupImageModelSelection(env, groupId);
-						const imageModelConfig = imageSelection.modelConfig;
-						const imageBytes = imageModelConfig
-							? await generateSummaryImage(env, { modelKey: imageSelection.modelKey, modelConfig: imageModelConfig }, plainSummaryMarkdown, persona)
-							: null;
-						// Uploaded to our own R2 bucket (group-scoped, unguessable filename) so it can be
-						// embedded as a plain HTTPS URL — attach://-style multipart uploads to sendRichMessage
-						// are not actually supported by the Bot API.
-						const imageUrl = imageBytes ? await uploadSummaryImageToR2(env, groupId, imageBytes) : null;
-
-						const summaryMarkdown = imageUrl
-							? `**Summary by ${selectedModel.modelKey} · image by ${imageSelection.modelKey}**\n\n${fixLink(rawSummary)}\n\n![Summary illustration](${imageUrl})`
-							: plainSummaryMarkdown;
-
-						const sent = await sendRichMessage(env, groupId, summaryMarkdown, bot.update.message!.message_id);
-
+						const sent = await generateAndSendSummary(env, groupId, results, summaryHeader, bot.update.message!.message_id);
 						if (!sent.ok) {
-							if (imageUrl) {
-								// Image markup rejected by the rich-message API — fall back to a
-								// plain photo reply followed by the text-only rich summary.
-								await sendPhoto(env, groupId, imageUrl, bot.update.message!.message_id);
-								const textOnlySent = await sendRichMessage(env, groupId, plainSummaryMarkdown, bot.update.message!.message_id);
-								if (!textOnlySent.ok) {
-									await bot.reply(`⚠️ Unable to generate enhanced markdown.`);
-								}
-							} else {
-								await bot.reply(`⚠️ Unable to generate enhanced markdown.`);
-							}
+							await bot.reply(`⚠️ Unable to generate enhanced markdown.`);
 						}
 					}
 					catch (e) {
@@ -1240,6 +1379,123 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 						? "Image generation disabled for /summary in this group."
 						: `Image model updated to ${requested.modelKey} (${requested.modelConfig!.label}).`
 				);
+				return new Response('ok');
+			})
+			.on("schedule", async (ctx) => {
+				// Configure the daily scheduled summary. Two entry points:
+				// - In a whitelisted group chat: /schedule [HH:00|off] applies to that group.
+				// - In the owner's private chat (admin interface): /schedule list shows every
+				//   whitelisted group with its ID, and /schedule <groupId> <HH:00|off> sets it.
+				const chat = ctx.update.message?.chat;
+				const userId = ctx.update.message?.from?.id;
+				const messageText = (ctx.update.message?.text || "").trim();
+				const args = messageText.split(/\s+/).slice(1);
+
+				const groupUsage = `Usage:\n/schedule <HH:00> — send a daily summary of the last 24h at that hour (US/Eastern, top of the hour)\n/schedule off — disable the daily summary`;
+
+				if (chat?.type === 'private') {
+					const ownerUserId = parseInt(env.OWNER_ID);
+					if (userId !== ownerUserId) {
+						await ctx.reply('You are not authorized to use this command.');
+						return new Response('ok');
+					}
+
+					const adminUsage = `Usage:\n/schedule list — show all whitelisted groups and their schedules\n/schedule <groupId> <HH:00> — set that group's daily summary hour (US/Eastern)\n/schedule <groupId> off — disable that group's daily summary`;
+
+					if (!args[0] || args[0].toLowerCase() === 'list') {
+						await ensureScheduleSettingsTable(env);
+						const { results: groups } = await env.DB.prepare(`
+							SELECT w.groupId,
+								COALESCE(
+									(SELECT m.groupName FROM Messages m WHERE CAST(m.groupId AS INTEGER) = CAST(w.groupId AS INTEGER) ORDER BY m.timeStamp DESC LIMIT 1),
+									w.groupName
+								) AS groupName,
+								s.hourEt
+							FROM WhitelistedGroups w
+							LEFT JOIN GroupScheduleSettings s ON CAST(s.groupId AS INTEGER) = CAST(w.groupId AS INTEGER)
+							ORDER BY w.groupId
+						`).all<{ groupId: string, groupName: string, hourEt: number | null }>();
+						if (!groups || groups.length === 0) {
+							await ctx.reply('No whitelisted groups yet.');
+							return new Response('ok');
+						}
+						const lines = groups.map((g) =>
+							`${g.groupName} (${g.groupId}) — ${g.hourEt == null ? 'no daily summary' : `daily summary at ${formatScheduleHour(g.hourEt)}`}`
+						);
+						await ctx.reply(`Whitelisted groups:\n${lines.join('\n')}\n\n${adminUsage}`);
+						return new Response('ok');
+					}
+
+					const targetGroupId = parseInt(args[0]);
+					if (isNaN(targetGroupId)) {
+						await ctx.reply(`Invalid group ID: ${args[0]}\n\n${adminUsage}`);
+						return new Response('ok');
+					}
+					const whitelisted = await env.DB.prepare(`
+						SELECT groupId FROM WhitelistedGroups WHERE CAST(groupId AS INTEGER) = ? LIMIT 1
+					`).bind(targetGroupId).first();
+					if (!whitelisted) {
+						await ctx.reply(`Group ${targetGroupId} is not whitelisted. Use /schedule list to see available groups.`);
+						return new Response('ok');
+					}
+
+					if (!args[1]) {
+						const currentHour = await getGroupScheduleHour(env, targetGroupId);
+						await ctx.reply(
+							`Group ${targetGroupId}: ${currentHour == null ? 'no daily summary scheduled' : `daily summary at ${formatScheduleHour(currentHour)}`}\n\n${adminUsage}`
+						);
+						return new Response('ok');
+					}
+					if (args[1].toLowerCase() === 'off') {
+						await deleteGroupSchedule(env, targetGroupId);
+						await ctx.reply(`Daily summary disabled for group ${targetGroupId}.`);
+						return new Response('ok');
+					}
+					const hour = parseScheduleHour(args[1]);
+					if (hour == null) {
+						await ctx.reply(`Invalid time: ${args[1]}. Use a top-of-the-hour time like 21:00 or 9.\n\n${adminUsage}`);
+						return new Response('ok');
+					}
+					await setGroupScheduleHour(env, targetGroupId, hour, userId);
+					await ctx.reply(`Daily summary for group ${targetGroupId} scheduled at ${formatScheduleHour(hour)} (covers the previous 24 hours).`);
+					return new Response('ok');
+				}
+
+				if (!chat || !chat.type.includes('group')) {
+					await ctx.reply('Please use /schedule in a group chat, or in a direct chat with the bot (admin).');
+					return new Response('ok');
+				}
+
+				const groupId = chat.id;
+				const { results: whitelistResults } = await env.DB.prepare(`
+					SELECT groupId FROM WhitelistedGroups WHERE CAST(groupId AS INTEGER) = ?
+				`).bind(groupId).all();
+				if (!whitelistResults || whitelistResults.length === 0) {
+					await ctx.reply(`This group (ID: ${groupId}) is not whitelisted. Please contact the bot owner.`);
+					const groupName = chat.title || 'Unknown';
+					await notifyOwnerAboutGroup(ctx.api, env, groupId, groupName);
+					return new Response('ok');
+				}
+
+				if (!args[0]) {
+					const currentHour = await getGroupScheduleHour(env, groupId);
+					await ctx.reply(
+						`${currentHour == null ? 'No daily summary scheduled for this group.' : `Daily summary scheduled at ${formatScheduleHour(currentHour)}.`}\n\n${groupUsage}`
+					);
+					return new Response('ok');
+				}
+				if (args[0].toLowerCase() === 'off') {
+					await deleteGroupSchedule(env, groupId);
+					await ctx.reply('Daily summary disabled for this group.');
+					return new Response('ok');
+				}
+				const hour = parseScheduleHour(args[0]);
+				if (hour == null) {
+					await ctx.reply(`Invalid time: ${args[0]}. Use a top-of-the-hour time like 21:00 or 9.\n\n${groupUsage}`);
+					return new Response('ok');
+				}
+				await setGroupScheduleHour(env, groupId, hour, userId);
+				await ctx.reply(`Daily summary scheduled at ${formatScheduleHour(hour)}. It will cover the previous 24 hours and is skipped if the group had fewer than ${MIN_SCHEDULED_SUMMARY_MESSAGES} messages.`);
 				return new Response('ok');
 			})
 			.on("persona", async (ctx) => {
