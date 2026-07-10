@@ -433,7 +433,7 @@ async function deleteBotSetting(env: Env, key: string) {
 
 // Skip a scheduled summary when the group had fewer messages than this in the
 // last 24h — the old auto-summary feature was removed for sending empty summaries.
-const MIN_SCHEDULED_SUMMARY_MESSAGES = 10;
+const MIN_SCHEDULED_SUMMARY_MESSAGES = 1;
 
 let scheduleSettingsTableReady = false;
 
