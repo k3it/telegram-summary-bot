@@ -497,6 +497,115 @@ function formatScheduleHour(hourEt: number) {
 	return `${hourEt.toString().padStart(2, "0")}:00 US/Eastern`;
 }
 
+// --- Summary continuity memory (anti-repetition across summaries) ---
+//
+// Each delivered summary is persisted per group, and the most recent ones are
+// fed back into the next summary prompt so the model can avoid rehashing the
+// same points. References the model incorporated (movies, books, quotes,
+// memes, ...) are remembered over a longer horizon in a compact list so the
+// persona picks fresh material instead of cycling through favorites.
+
+// Summaries kept per group, and how many of them go back into the prompt.
+const SUMMARY_HISTORY_KEEP = 10;
+const SUMMARY_HISTORY_IN_PROMPT = 3;
+// Cap on remembered references per group (~50 prompt tokens, weeks of history).
+const USED_REFS_KEEP = 30;
+
+let summaryHistoryTableReady = false;
+
+async function ensureSummaryHistoryTables(env: Env) {
+	if (summaryHistoryTableReady) {
+		return;
+	}
+	await env.DB.prepare(`
+		CREATE TABLE IF NOT EXISTS SummaryHistory (
+			groupId TEXT,
+			timeStamp INTEGER NOT NULL,
+			summaryText TEXT NOT NULL
+		)
+	`).run();
+	await env.DB.prepare(`
+		CREATE INDEX IF NOT EXISTS idx_summaryhistory_groupid_timestamp
+			ON SummaryHistory(groupId, timeStamp DESC)
+	`).run();
+	await env.DB.prepare(`
+		CREATE TABLE IF NOT EXISTS GroupUsedRefs (
+			groupId TEXT PRIMARY KEY,
+			refs TEXT NOT NULL,
+			updatedAt INTEGER NOT NULL
+		)
+	`).run();
+	summaryHistoryTableReady = true;
+}
+
+// Most recent summaries for the group, newest first.
+async function getRecentSummaries(env: Env, groupId: number): Promise<string[]> {
+	await ensureSummaryHistoryTables(env);
+	const { results } = await env.DB.prepare(`
+		SELECT summaryText FROM SummaryHistory
+		WHERE CAST(groupId AS INTEGER) = ?
+		ORDER BY timeStamp DESC
+		LIMIT ?
+	`).bind(groupId, SUMMARY_HISTORY_IN_PROMPT).all<{ summaryText: string }>();
+	return (results ?? []).map((r) => r.summaryText);
+}
+
+async function getUsedRefs(env: Env, groupId: number): Promise<string[]> {
+	await ensureSummaryHistoryTables(env);
+	const row = await env.DB.prepare(`
+		SELECT refs FROM GroupUsedRefs WHERE CAST(groupId AS INTEGER) = ? LIMIT 1
+	`).bind(groupId).first<{ refs: string }>();
+	if (!row?.refs) {
+		return [];
+	}
+	try {
+		const parsed = JSON.parse(row.refs);
+		return Array.isArray(parsed) ? parsed.filter((r): r is string => typeof r === "string") : [];
+	} catch {
+		return [];
+	}
+}
+
+// Merge newly used references into the remembered list, deduped
+// case-insensitively, dropping the oldest past the cap.
+export function mergeUsedRefs(priorRefs: string[], newRefs: string[], keep = USED_REFS_KEEP): string[] {
+	const merged = [...priorRefs];
+	const seen = new Set(priorRefs.map((r) => r.toLowerCase()));
+	for (const ref of newRefs) {
+		const key = ref.toLowerCase();
+		if (!seen.has(key)) {
+			seen.add(key);
+			merged.push(ref);
+		}
+	}
+	return merged.slice(-keep);
+}
+
+// Persist a delivered summary and its references for future continuity notes.
+async function saveSummaryMemory(env: Env, groupId: number, summaryText: string, newRefs: string[], priorRefs: string[]) {
+	await ensureSummaryHistoryTables(env);
+	await env.DB.prepare(`
+		INSERT INTO SummaryHistory(groupId, timeStamp, summaryText)
+		VALUES (CAST(? AS INTEGER), ?, ?)
+	`).bind(groupId, Date.now(), summaryText).run();
+	await env.DB.prepare(`
+		DELETE FROM SummaryHistory
+		WHERE CAST(groupId AS INTEGER) = ?
+		AND rowid NOT IN (
+			SELECT rowid FROM SummaryHistory
+			WHERE CAST(groupId AS INTEGER) = ?
+			ORDER BY timeStamp DESC
+			LIMIT ?
+		)
+	`).bind(groupId, groupId, SUMMARY_HISTORY_KEEP).run();
+	if (newRefs.length > 0) {
+		await env.DB.prepare(`
+			INSERT OR REPLACE INTO GroupUsedRefs(groupId, refs, updatedAt)
+			VALUES (CAST(? AS INTEGER), ?, ?)
+		`).bind(groupId, JSON.stringify(mergeUsedRefs(priorRefs, newRefs)), Date.now()).run();
+	}
+}
+
 // Resolve the personality override (universal across all groups) and temperature.
 async function getBotPersona(env: Env) {
 	return await getBotSetting(env, "persona");
@@ -605,6 +714,7 @@ Follow these guidelines:
 6. Output must be entirely in English, but it is fine to quote non-English content from the chat as long as the summary itself is in English.
 7. For each topic add a brief bullet paragraph offset note labeled "AI context:" — 1-2 factual, useful pieces of information relevant to the topic (background facts, current data, clarifications, or counterpoints from general knowledge). Do NOT comment on the tone, humor, or sentiment of the conversation.
 8. Keep the total response within ~256 words and be as concise as possible.
+9. End the response with one final line of the exact form <!--refs: item1; item2--> listing every reference you incorporated that comes from outside the chat itself — movies, books, songs, memes, famous quotes, historical events, analogies, and any other cultural or external reference — each in a compact short form (e.g. "The Matrix", "boiling frog analogy"). If you used none, end with <!--refs: none-->. This line is machine-read and removed before posting; it does not count toward the ~256-word limit.
 
 Formatting: respond in clean GitHub-Flavored Markdown. Use formatting freely where it improves readability — text color, headings, **bold**, _italic_, ~~strikethrough~~, bullet and numbered lists (nesting allowed), > blockquotes, tables, fenced code blocks, and inline [text](url) links, and markdown color. Use LaTeX for any math ($x^2$ inline, $$...$$ for block). Do not wrap the whole response in a code block.`;
 
@@ -635,6 +745,39 @@ function buildSystemPrompts(personaOverride: string | null) {
 		summarizeChat: `${summarizePersona}${PROMPT_BODY_SUMMARIZE}`,
 		answerQuestion: `${answerPersona}${PROMPT_BODY_ANSWER}`,
 	};
+}
+
+// Split the machine-readable references footer (rule 9 in PROMPT_BODY_SUMMARIZE)
+// off the model output. Returns the summary without the footer plus the parsed
+// reference list; tolerates the model omitting the footer entirely.
+export function extractRefsFooter(rawSummary: string): { summary: string, refs: string[] } {
+	const m = rawSummary.match(/<!--\s*refs:\s*((?:(?!-->)[\s\S])*?)\s*-->\s*$/i);
+	if (!m) {
+		return { summary: rawSummary.trim(), refs: [] };
+	}
+	const refs = m[1]
+		.split(";")
+		.map((r) => r.trim())
+		.filter((r) => r.length > 0 && r.toLowerCase() !== "none");
+	return { summary: rawSummary.slice(0, m.index).trim(), refs };
+}
+
+// Per-request continuity note injected into the summary prompt: recent
+// summaries the model must not rehash, and references it must not reuse.
+export function buildContinuityNote(previousSummaries: string[], usedRefs: string[]): string | null {
+	const parts: string[] = [];
+	if (previousSummaries.length > 0) {
+		parts.push(
+			`For continuity, your most recent summaries for this group (newest first) are between the markers below. Do not repeat points they already cover unless there is a genuinely new development — in that case cover only what's new. Ongoing topics may be mentioned again when something changed; the goal is fresh content, not pretending past topics don't exist.`,
+			`<previous-summaries>`,
+			previousSummaries.join("\n\n--- earlier summary ---\n\n"),
+			`</previous-summaries>`,
+		);
+	}
+	if (usedRefs.length > 0) {
+		parts.push(`You have already used these references in past summaries — do NOT reuse any of them; if your style calls for references, pick fresh ones: ${usedRefs.join("; ")}`);
+	}
+	return parts.length > 0 ? parts.join("\n") : null;
 }
 
 function getCommandVar(str: string, delim: string) {
@@ -870,6 +1013,11 @@ async function generateAndSendSummary(
 	const persona = await getBotPersona(env);
 	const systemPrompts = buildSystemPrompts(persona);
 	const botTemperature = await getBotTemperature(env);
+	const [previousSummaries, usedRefs] = await Promise.all([
+		getRecentSummaries(env, groupId),
+		getUsedRefs(env, groupId),
+	]);
+	const continuityNote = buildContinuityNote(previousSummaries, usedRefs);
 
 	const rawSummary = await createModelResponse(
 		env,
@@ -883,6 +1031,7 @@ async function generateAndSendSummary(
 				role: "user",
 				content: [
 					dispatchContent(`Please summarize this chat history.\n${summaryHeader}`),
+					...(continuityNote ? [dispatchContent(continuityNote)] : []),
 					...results.flatMap(
 						(r: any) => [
 							dispatchContent(`====================`),
@@ -898,8 +1047,10 @@ async function generateAndSendSummary(
 		botTemperature,
 	);
 
+	const { summary: summaryBody, refs: newRefs } = extractRefsFooter(rawSummary);
+
 	// Pass the model's GitHub-Flavored Markdown verbatim to Telegram as a rich message.
-	const plainSummaryMarkdown = `**Summary by ${selectedModel.modelKey}**\n\n${fixLink(rawSummary)}`;
+	const plainSummaryMarkdown = `**Summary by ${selectedModel.modelKey}**\n\n${fixLink(summaryBody)}`;
 
 	const imageSelection = await getGroupImageModelSelection(env, groupId);
 	const imageModelConfig = imageSelection.modelConfig;
@@ -912,22 +1063,30 @@ async function generateAndSendSummary(
 	const imageUrl = imageBytes ? await uploadSummaryImageToR2(env, groupId, imageBytes) : null;
 
 	const summaryMarkdown = imageUrl
-		? `**Summary by ${selectedModel.modelKey} · image by ${imageSelection.modelKey}**\n\n${fixLink(rawSummary)}\n\n![Summary illustration](${imageUrl})`
+		? `**Summary by ${selectedModel.modelKey} · image by ${imageSelection.modelKey}**\n\n${fixLink(summaryBody)}\n\n![Summary illustration](${imageUrl})`
 		: plainSummaryMarkdown;
 
 	const sent = await sendRichMessage(env, groupId, summaryMarkdown, replyToMessageId);
 
-	if (!sent.ok) {
-		if (imageUrl) {
-			// Image markup rejected by the rich-message API — fall back to a
-			// plain photo reply followed by the text-only rich summary.
-			await sendPhoto(env, groupId, imageUrl, replyToMessageId);
-			const textOnlySent = await sendRichMessage(env, groupId, plainSummaryMarkdown, replyToMessageId);
-			return { ok: textOnlySent.ok };
-		}
-		return { ok: false };
+	let delivered = sent.ok;
+	if (!sent.ok && imageUrl) {
+		// Image markup rejected by the rich-message API — fall back to a
+		// plain photo reply followed by the text-only rich summary.
+		await sendPhoto(env, groupId, imageUrl, replyToMessageId);
+		const textOnlySent = await sendRichMessage(env, groupId, plainSummaryMarkdown, replyToMessageId);
+		delivered = textOnlySent.ok;
 	}
-	return { ok: true };
+
+	// Only remember summaries the group actually saw; an undelivered summary
+	// must not suppress the same points on the next attempt.
+	if (delivered) {
+		try {
+			await saveSummaryMemory(env, groupId, summaryBody, newRefs, usedRefs);
+		} catch (e) {
+			console.error("saveSummaryMemory failed", e);
+		}
+	}
+	return { ok: delivered };
 }
 
 /**

@@ -43,3 +43,17 @@ CREATE TABLE IF NOT EXISTS BotSettings (
 	updatedAt INTEGER NOT NULL,
 	updatedBy INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS SummaryHistory (
+	groupId TEXT,
+	timeStamp INTEGER NOT NULL,
+	summaryText TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_summaryhistory_groupid_timestamp
+			ON SummaryHistory(groupId, timeStamp DESC);
+
+CREATE TABLE IF NOT EXISTS GroupUsedRefs (
+	groupId TEXT PRIMARY KEY,
+	refs TEXT NOT NULL,
+	updatedAt INTEGER NOT NULL
+);

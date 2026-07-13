@@ -9,6 +9,9 @@ import {
 	extractInlineImage,
 	randomAlphanumeric,
 	parseScheduleHour,
+	extractRefsFooter,
+	buildContinuityNote,
+	mergeUsedRefs,
 } from "./../src/index"
 
 describe("test fix link", () => {
@@ -140,6 +143,68 @@ describe("parseScheduleHour", () => {
 		expect(parseScheduleHour("off")).toBeNull();
 		expect(parseScheduleHour("21:0")).toBeNull();
 		expect(parseScheduleHour("")).toBeNull();
+	});
+});
+
+describe("extractRefsFooter", () => {
+	it("strips the footer and parses semicolon-separated refs", () => {
+		const raw = `**Topic 1: Deploys**\nStuff happened.\n\n<!--refs: The Matrix; boiling frog analogy-->`;
+		const { summary, refs } = extractRefsFooter(raw);
+		expect(summary).toBe("**Topic 1: Deploys**\nStuff happened.");
+		expect(refs).toEqual(["The Matrix", "boiling frog analogy"]);
+	});
+
+	it("treats a 'none' footer as no refs", () => {
+		const { summary, refs } = extractRefsFooter("Summary text.\n<!--refs: none-->");
+		expect(summary).toBe("Summary text.");
+		expect(refs).toEqual([]);
+	});
+
+	it("tolerates a missing footer", () => {
+		const { summary, refs } = extractRefsFooter("Summary with no footer.");
+		expect(summary).toBe("Summary with no footer.");
+		expect(refs).toEqual([]);
+	});
+
+	it("ignores refs-like comments that are not the final line", () => {
+		const raw = "Before <!--refs: Dune--> after.";
+		const { summary, refs } = extractRefsFooter(raw);
+		expect(summary).toBe(raw);
+		expect(refs).toEqual([]);
+	});
+
+	it("drops empty items and trailing whitespace variants", () => {
+		const { refs } = extractRefsFooter("Text\n<!-- refs: Dune; ; 1984 -->\n");
+		expect(refs).toEqual(["Dune", "1984"]);
+	});
+});
+
+describe("buildContinuityNote", () => {
+	it("returns null when there is no history", () => {
+		expect(buildContinuityNote([], [])).toBeNull();
+	});
+
+	it("includes previous summaries between markers", () => {
+		const note = buildContinuityNote(["newest summary", "older summary"], []);
+		expect(note).toContain("<previous-summaries>");
+		expect(note).toContain("newest summary\n\n--- earlier summary ---\n\nolder summary");
+		expect(note).not.toContain("already used these references");
+	});
+
+	it("includes the used-refs blocklist without summaries", () => {
+		const note = buildContinuityNote([], ["The Matrix", "Dune"]);
+		expect(note).toContain("The Matrix; Dune");
+		expect(note).not.toContain("<previous-summaries>");
+	});
+});
+
+describe("mergeUsedRefs", () => {
+	it("appends new refs and dedupes case-insensitively", () => {
+		expect(mergeUsedRefs(["The Matrix"], ["the matrix", "Dune"])).toEqual(["The Matrix", "Dune"]);
+	});
+
+	it("drops the oldest refs past the cap", () => {
+		expect(mergeUsedRefs(["a", "b", "c"], ["d", "e"], 4)).toEqual(["b", "c", "d", "e"]);
 	});
 });
 
