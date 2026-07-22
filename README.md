@@ -6,7 +6,7 @@
 
 Feel scared when seeing 2000+ unread in groups? Now you can read them by LLM!
 
-Use d1, cf worker, ai gateway, gemini-3.5-flash.
+Use d1, cf worker, ai gateway, gemini-3.6-flash.
 
 ## NOTICE
 
@@ -91,7 +91,7 @@ d1: telegram bot can't read info in the history, only newly sent info, so use da
 
 cf worker: so no more offline.(I hope so) [pricing](https://developers.cloudflare.com/workers/platform/pricing/#workers)
 
-gemini-3.5-flash: free for limited usage and huge context
+gemini-3.6-flash: free for limited usage and huge context
 
 ---
 

@@ -12,7 +12,25 @@ import {
 	extractRefsFooter,
 	buildContinuityNote,
 	mergeUsedRefs,
+	resolveMaxOutputTokens,
 } from "./../src/index"
+
+describe("resolveMaxOutputTokens", () => {
+	it("uses a valid numeric override", () => {
+		expect(resolveMaxOutputTokens("8192", 32768)).toBe(8192);
+	});
+
+	it("falls back when the override is missing or unparseable", () => {
+		expect(resolveMaxOutputTokens(undefined, 32768)).toBe(32768);
+		expect(resolveMaxOutputTokens("", 32768)).toBe(32768);
+		expect(resolveMaxOutputTokens("lots", 32768)).toBe(32768);
+	});
+
+	it("rejects zero and negative budgets rather than starving the reply", () => {
+		expect(resolveMaxOutputTokens("0", 32768)).toBe(32768);
+		expect(resolveMaxOutputTokens("-5", 32768)).toBe(32768);
+	});
+})
 
 describe("test fix link", () => {
 	it("should fix link", () => {
@@ -51,9 +69,14 @@ describe("gateway provider slug mapping", () => {
 });
 
 describe("getModelByKey", () => {
-	it("resolves the default gemini-3.5-flash registry entry", () => {
-		const result = getModelByKey("gemini-3.5-flash");
+	it("resolves the default gemini-3.6-flash registry entry", () => {
+		const result = getModelByKey("gemini-3.6-flash");
 		expect(result?.modelConfig.provider).toBe("google");
+		expect(result?.modelConfig.model).toBe("gemini-3.6-flash");
+	});
+
+	it("keeps gemini-3.5-flash selectable after the 3.6 default switch", () => {
+		const result = getModelByKey("gemini-3.5-flash");
 		expect(result?.modelConfig.model).toBe("gemini-3.5-flash");
 	});
 

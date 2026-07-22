@@ -133,7 +133,7 @@ export const GATEWAY_PROVIDER_SLUG: Record<Exclude<Provider, "workers-ai">, stri
 	anthropic: "anthropic",
 };
 
-const DEFAULT_MODEL_KEY = "gemini-3.5-flash";
+const DEFAULT_MODEL_KEY = "gemini-3.6-flash";
 const MODEL_REGISTRY: Record<string, ModelConfig> = {
 	"gpt-5.5": { provider: "openai", model: "gpt-5.5", label: "GPT-5.5", noTemperature: true },
 	"gpt-5.5-mini": { provider: "openai", model: "gpt-5.5-mini", label: "GPT-5.5 Mini", noTemperature: true },
@@ -145,6 +145,7 @@ const MODEL_REGISTRY: Record<string, ModelConfig> = {
 	"gpt-4.1-nano": { provider: "openai", model: "gpt-4.1-nano", label: "GPT-4.1 Nano" },
 	"o4-mini": { provider: "openai", model: "o4-mini", label: "o4-mini", noTemperature: true },
 	"o3": { provider: "openai", model: "o3", label: "o3", noTemperature: true },
+	"gemini-3.6-flash": { provider: "google", model: "gemini-3.6-flash", label: "Gemini 3.6 Flash" },
 	"gemini-3.5-flash": { provider: "google", model: "gemini-3.5-flash", label: "Gemini 3.5 Flash" },
 	"gemini-2.5-pro": { provider: "google", model: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
 	"gemini-2.5-flash": { provider: "google", model: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
@@ -155,6 +156,31 @@ const MODEL_REGISTRY: Record<string, ModelConfig> = {
 };
 
 const DEFAULT_TEMPERATURE = 0.4;
+
+// --- Output token budgets ---
+//
+// Reasoning models (Gemini 3.x Flash, GPT-5.x, o3/o4) bill their internal
+// thinking against the same max_completion_tokens ceiling as the visible reply,
+// and thinking runs first. Too small a budget is spent entirely on thinking and
+// the answer is cut off mid-sentence — the summary still sends, just truncated.
+//
+// Observed on a 60-message summary with gemini-3.x-flash: ~2.6k-3.9k thinking
+// tokens plus ~500 visible. The old flat 4096 left ~150 tokens for the reply and
+// truncated. These defaults are deliberately generous: the models stop when done,
+// so a high ceiling costs nothing on a short reply and only pays out when a long
+// chat genuinely needs the room.
+const DEFAULT_MAX_OUTPUT_TOKENS = 32768;
+// Summaries reason over the whole 24h window plus the continuity note.
+const SUMMARY_MAX_OUTPUT_TOKENS = 32768;
+// Answers reason over one question against the same history.
+const ANSWER_MAX_OUTPUT_TOKENS = 16384;
+
+// Env overrides let the budget be retuned without a code change; a non-numeric
+// or non-positive value falls back to the compiled-in default.
+export function resolveMaxOutputTokens(raw: string | undefined, fallback: number): number {
+	const parsed = raw == null ? NaN : parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 let modelSettingsTableReady = false;
 let botSettingsTableReady = false;
@@ -633,13 +659,17 @@ function flattenToText(content: string | DispatchContent[]): string {
 	return content.filter((b): b is { type: "text", text: string } => b.type === "text").map((b) => b.text).join("\n");
 }
 
+// A model reply plus whether the provider stopped it at the token ceiling.
+// `truncated` lets callers avoid treating a half-written reply as a good one.
+type ModelResult = { text: string, truncated: boolean };
+
 async function createModelResponse(
 	env: Env,
 	selectedModel: { modelKey: string, modelConfig: ModelConfig },
 	messages: ChatMessage[],
-	maxTokens = 4096,
+	maxTokens = DEFAULT_MAX_OUTPUT_TOKENS,
 	temperature = DEFAULT_TEMPERATURE,
-) {
+): Promise<ModelResult> {
 	const { provider, model, noTemperature } = selectedModel.modelConfig;
 
 	if (provider === "workers-ai") {
@@ -652,7 +682,7 @@ async function createModelResponse(
 			} as any,
 			{ gateway: { id: env.AI_GATEWAY_ID } },
 		);
-		return response?.response || "";
+		return { text: response?.response || "", truncated: false };
 	}
 
 	if (!env.WORKER_AI_TOKEN) {
@@ -669,7 +699,17 @@ async function createModelResponse(
 		},
 		{ headers: { Authorization: `Bearer ${apiKey}` } },
 	);
-	return response.choices[0].message.content || "";
+	const choice = response.choices[0];
+	const truncated = choice?.finish_reason === "length";
+	if (truncated) {
+		// Reasoning models spend this ceiling on thinking before they emit a token,
+		// so hitting it usually means the budget needs raising, not the prompt shortening.
+		console.error(
+			`Model ${selectedModel.modelKey} hit the ${maxTokens}-token ceiling; reply is truncated.`,
+			JSON.stringify(response.usage),
+		);
+	}
+	return { text: choice?.message?.content || "", truncated };
 }
 
 // Notify owner about non-whitelisted group (only once per deployment)
@@ -1043,11 +1083,11 @@ async function generateAndSendSummary(
 				],
 			},
 		],
-		4096,
+		resolveMaxOutputTokens(env.SUMMARY_MAX_OUTPUT_TOKENS, SUMMARY_MAX_OUTPUT_TOKENS),
 		botTemperature,
 	);
 
-	const { summary: summaryBody, refs: newRefs } = extractRefsFooter(rawSummary);
+	const { summary: summaryBody, refs: newRefs } = extractRefsFooter(rawSummary.text);
 
 	// Pass the model's GitHub-Flavored Markdown verbatim to Telegram as a rich message.
 	const plainSummaryMarkdown = `**Summary by ${selectedModel.modelKey}**\n\n${fixLink(summaryBody)}`;
@@ -1078,8 +1118,10 @@ async function generateAndSendSummary(
 	}
 
 	// Only remember summaries the group actually saw; an undelivered summary
-	// must not suppress the same points on the next attempt.
-	if (delivered) {
+	// must not suppress the same points on the next attempt. Truncated summaries
+	// are excluded too: storing a half-written one would feed the fragment back as
+	// "already covered", suppressing topics it never actually reached.
+	if (delivered && !rawSummary.truncated) {
 		try {
 			await saveSummaryMemory(env, groupId, summaryBody, newRefs, usedRefs);
 		} catch (e) {
@@ -1306,7 +1348,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 					const persona = await getBotPersona(env);
 					const systemPrompts = buildSystemPrompts(persona);
 					const botTemperature = await getBotTemperature(env);
-					answerText = await createModelResponse(
+					answerText = (await createModelResponse(
 						env,
 						selectedModel,
 						[
@@ -1325,9 +1367,9 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 									: `Question: ${question}`,
 							},
 						],
-						4096,
+						resolveMaxOutputTokens(env.ANSWER_MAX_OUTPUT_TOKENS, ANSWER_MAX_OUTPUT_TOKENS),
 						botTemperature,
-					);
+					)).text;
 				} catch (e) {
 					console.error(e);
 					await ctx.reply(`Model call failed: ${(e as Error).message}`);

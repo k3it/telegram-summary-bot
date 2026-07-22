@@ -13,4 +13,8 @@ interface Env {
 	DB: D1Database;
 	SUMMARY_IMAGES: R2Bucket;
 	OWNER_ID: string;
+	// Optional overrides for the model output-token ceilings (see
+	// SUMMARY_MAX_OUTPUT_TOKENS / ANSWER_MAX_OUTPUT_TOKENS in src/index.ts).
+	SUMMARY_MAX_OUTPUT_TOKENS?: string;
+	ANSWER_MAX_OUTPUT_TOKENS?: string;
 }
